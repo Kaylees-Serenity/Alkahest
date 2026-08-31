@@ -10,6 +10,31 @@ DIAGNOSE  ->  QUENCH  ->  DISSOLVE  ->  RECONSTITUTE  ->  PROGNOSIS
  read it     stop it     rename it     put it back      tell the truth
 ```
 
+## Same chrome as Panacea
+
+They are meant to look and behave like the same instrument. Shared, byte-for-byte where it
+matters:
+
+- **Palette** — the same `$Clr` table (orange `255,140,0`, green `80,200,120`,
+  cyan `90,190,220`, grey `120,120,120`, red `220,50,50`).
+- **VT sniff and ASCII skin** — `$Host.UI.SupportsVirtualTerminal`, with the same `$G` glyph
+  map degrading `[✓] ℞ ⚕ ⚠` to `[OK] Rx + !!` when the console can't do truecolor.
+- **`Rule` / `Status` / `Roll`** — identical signatures, identical dot-leader widths, the same
+  `[DRY RUN]` suffix on every tier header.
+- **`Invoke-Guarded`** — Panacea's, adopted whole: `Register-ObjectEvent` with a `try/finally`
+  unregister so no subscription outlives the scriptblock, braille spinner, `-ShowNative` for
+  DISM/SFC's own progress bar, S-key skip, `0` meaning infinite.
+- **Rx label** — same 62-wide box, same `RX # / DATE / REFILLS ∞ / PATIENT / PRESCRIBER / DX`
+  header, same conditional orange **AUXILIARY WARNINGS** sticker, same
+  `keep out of reach of end users` footer.
+- **Exit contract** — `$global:AlkahestExit` (0 clear, 1 reboot-needed, 2 attention), no `exit`
+  call, same `dispensary closed · ... · log:` epitaph, JSON summary written beside the
+  transcript for RMM ingest.
+- **SFC verdict** — read from the CBS.log delta, not stdout, because `-ShowNative` doesn't
+  redirect stdout. Same technique as Panacea's MEND tier, same English-string caveat.
+
+Tier verbs differ on purpose: Panacea mends and doses, ALKAHEST quenches and dissolves.
+
 ## Running it
 
 Copy the **entire** contents of `alkahest_paste.ps1` — from `$alkahest = @'` through the
@@ -17,21 +42,18 @@ final `[ScriptBlock]::Create($alkahest).Invoke()` — and paste it into an eleva
 ScreenConnect backstage or frontstage PowerShell prompt. It arrives as one indivisible
 object, so the console cannot nibble it line by line and detonate a fragment early.
 
-A setup panel opens first. `ENTER` starts with the defaults; number keys toggle. During any
-long step, `S` skips that step and moves on.
+The DISPENSARY SETUP panel opens first on an interactive console and is skipped under
+SYSTEM. `Enter` proceeds, `Q` quits touching nothing, number keys toggle. Once a long step is
+running, `S` skips it.
 
-| Option | Default | What it does |
-|---|---|---|
-| Dry run | off | Narrates every action, changes nothing |
-| Step timeout | infinite | Slow boxes are the normal case, so nothing is cut by default |
-| Servicing repair | on | DISM RestoreHealth + SFC, only if the image actually looks sick |
-| Component cleanup | off | `StartComponentCleanup`, never `/ResetBase` |
-| Clear WU policy | **off** | Backs up then removes GPO-path WSUS keys. Requires typing `CLEAR` |
-| Queue locked work | off | If a cache is locked, schedule the rename for next boot |
-
-`$global:AlkahestExit` carries the verdict — `0` clear or dissolved, `1` partial, `2` needs a
-human — without killing the host session. A JSON summary lands in
-`C:\ProgramData\Alkahest\` alongside the transcript, for RMM ingest.
+| # | Option | Default | What it does |
+|---|---|---|---|
+| 1 | DryRun | off | Narrates every action, changes nothing |
+| 2 | Servicing repair | on | DISM RestoreHealth + SFC, only if the store looks sick |
+| 3 | WinSxS cleanup | off | `StartComponentCleanup`, never `/ResetBase` |
+| 4 | Timeouts | ∞ | Cycles ∞ → 30m → 60m. Slow boxes are the normal case |
+| 5 | Clear WU policy | **off** | Backs up then removes GPO-path WSUS keys. Requires typing `CLEAR` |
+| 6 | Queue locked work | off | If a cache is locked, schedule the rename for next boot |
 
 ## Panda Adaptive Defense
 
@@ -51,8 +73,8 @@ Microsoft-signed binaries nobody argues with, `DISM.exe` and `sfc.exe`.
 
 Panda also holds file handles inside `SoftwareDistribution` while it scans staged payloads,
 so renames retry four times with backoff, fall back to renaming `Download` and `DataStore`
-individually, and then report **BLOCKED** rather than forcing anything. A blocked step never
-kills the run.
+individually, and then report locked rather than forcing anything. A blocked step never kills
+the run.
 
 ## Update policy: GPO vs Intune
 
@@ -86,26 +108,24 @@ and a pinned target release version look exactly like a stuck update stack.
 ## What it will not do
 
 - **Delete.** Caches are renamed to `.old.<timestamp>`, so every step is reversible.
-- **Reboot.** It says so in orange when a restart is the actual fix, and stops there.
+- **Reboot.** It says so on the orange sticker when a restart is the actual fix, and stops there.
 - **Touch a staged CBS transaction.** `pending.xml`, `SessionsPending.xml` and the
   PackagesPending key are reported, never cleared. Clearing those by hand is how a machine
   gets a half-installed component store.
-- **Clear update policy silently.** MSP clients point at WSUS on purpose. Policy is reported
-  by default; removal is opt-in, backed up to `.reg` first, and refuses to proceed if the
-  backup fails. See the note below on what that option does and does not reach.
+- **Clear WSUS/Intune policy silently.** Policy is reported by default; removal is opt-in,
+  backed up to `.reg` first, and refuses to proceed if the backup fails.
 - **Claim the machine is up to date.** It requests a detection pass and reports that it
   *asked*. Under SYSTEM the COM search can no-op silently, and a "current" verdict from here
   would be a lie.
 
 ## Notes for the next person in this file
 
-- `Invoke-Guarded` reads the child process's stdout synchronously, character by character. It
-  deliberately does **not** use `Register-ObjectEvent`: that pattern leaks event subscriptions
-  into the host runspace whenever anything between register and unregister throws, which is a
-  bug Panacea already paid for. The char-level read is also what makes DISM's carriage-return
-  progress bar render live.
-- Tradeoff of that choice: stderr is drained only after the process exits, so a child that
-  floods stderr could in principle fill its pipe. DISM and SFC do not.
+- Presentation is deliberately a copy of Panacea's. If you change the palette, the glyph map,
+  `Rule`/`Status`/`Roll`, or the label frame here, change it there too or the pair stops
+  reading as one instrument.
+- DISM and SFC verdict parsing matches English strings. On a localized install those differ;
+  parse `Image Health State:` out of `%WINDIR%\Logs\DISM\dism.log` instead, which stays
+  English. Same caveat Panacea carries.
 - Adding features here is how this turns into the Swiss army knife it is not supposed to be.
   Disk cleanup, startup analysis, driver work and SMART all live elsewhere — Panacea and Augur
   already own them.

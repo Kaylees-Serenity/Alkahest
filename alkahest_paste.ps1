@@ -1,941 +1,1079 @@
 ﻿$alkahest = @'
-#Requires -Version 5.1
-#===============================================================================
-#  ALKAHEST  -  the universal solvent
-#  Sibling to Panacea. Dissolves stuck / pending Windows Updates.
-#
-#  Constraints (by design, do not "improve" these away):
-#    * ONE copy-paste. No modules to install, no downloads, no helper scripts.
-#    * PowerShell 5.1 target. In-box cmdlets only.
-#    * Paste-safe: whole body is a here-string, parsed once by ScriptBlock::Create.
-#    * No -EncodedCommand, no regsvr32, no bitsadmin, no wusa, no sc.exe.
-#      Those are the classic LOLBins Panda Adaptive Defense flags. See DESIGN NOTE.
-#    * Nothing is deleted. Caches are RENAMED. User files are untouchable.
-#    * No forced reboot. Ever. It recommends, loudly, and stops there.
-#    * Infinite timeouts by default. Slow boxes are the normal case.
-#    * Graceful degradation: a blocked step is reported as BLOCKED, not fatal.
-#    * No exit. $global:AlkahestExit carries the verdict so the host survives.
-#===============================================================================
+#requires -version 5.1
+<#
+    ℞ ALKAHEST — the universal solvent
+    Sibling to Panacea. Dissolves stuck / pending Windows Updates.
+    Native-only · fails-closed · single-paste · nothing deleted · never reboots
+    Run from ScreenConnect backstage (SYSTEM) or frontstage admin prompt.
 
-#--- CONFIG --------------------------------------------------------------------
-$script:Cfg = [ordered]@{
-    DryRun            = $false   # narrate every action, change nothing
-    TimeoutSec        = 0        # 0 = infinite; per-operation S-key bail always live
-    ServicingRepair   = $true    # DISM RestoreHealth + SFC when the image looks sick
-    ComponentCleanup  = $false   # DISM StartComponentCleanup (never /ResetBase)
-    ClearPolicyKeys   = $false   # OFF. Clients legitimately run WSUS/Intune policy.
-    ScheduleLocked    = $false   # OFF. Queue locked renames for next boot.
-    NoColor           = $false
+    Panda Adaptive Defense note: no regsvr32, no bitsadmin, no wusa, no sc.exe,
+    no -EncodedCommand. Those are the LOLBins Panda blocks. See DISSOLVE.
+#>
+
+# ═══════════════════════════════════════════════════════════════
+#  CONFIG BLOCK  —  every behavior decision lives here, up top
+# ═══════════════════════════════════════════════════════════════
+$Alkahest = [ordered]@{
+    Version         = '1.1'
+    NoColor         = $false       # force ASCII/no-VT skin
+    MinFreeGB       = 10           # updates stall below this; symptom, not a stop
+    LogRoot         = "$env:ProgramData\Alkahest\Updates"
+    DryRun          = $false       # rehearsal mode: report what WOULD happen, mutate nothing
+    ShowSetup       = $true        # show the interactive configure panel before DIAGNOSE
+    ServicingRepair = $true        # DISM RestoreHealth + SFC when the store looks sick
+    RunWinSxS       = $false       # DISM StartComponentCleanup (never /ResetBase)
+    ClearPolicy     = $false       # OFF. clients run WSUS/Intune on purpose. arms with CLEAR
+    ScheduleLocked  = $false       # if a cache is locked, queue the rename for next boot
+    # long-running operation ceilings (seconds) — 0 = infinite (default; rely on Windows).
+    # slow boxes are the norm; the S-key still gives instant bail on any long op.
+    DismCheckTimeoutSec   = 0
+    DismRestoreTimeoutSec = 0
+    SfcTimeoutSec         = 0
+    WinSxSTimeoutSec      = 0
+    PkgScanTimeoutSec     = 0
 }
 
-$script:Name    = 'ALKAHEST'
-$script:Version = '1.0'
-$script:Started = Get-Date
-$script:Stamp   = $script:Started.ToString('yyyyMMdd_HHmmss')
-$script:Root    = Join-Path $env:ProgramData 'Alkahest'
-$script:LogFile = Join-Path $script:Root ("alkahest_{0}_{1}.log" -f $env:COMPUTERNAME, $script:Stamp)
-$script:Ledger      = New-Object System.Collections.ArrayList
-$script:Advisories  = New-Object System.Collections.ArrayList
-$script:SvcPrior    = @{}
-$global:AlkahestExit = 0
-
-#--- PRESENTATION --------------------------------------------------------------
-$ESC = [char]27
-function Paint {
-    param([int]$R,[int]$G,[int]$B,[string]$Text)
-    if ($script:Cfg.NoColor) { return $Text }
-    "$ESC[38;2;$R;$G;${B}m$Text$ESC[0m"
-}
-function Bone  { param([string]$t) Paint 216 210 196 $t }
-function Dim   { param([string]$t) Paint 107 107 120 $t }
-function Amber { param([string]$t) Paint 208 138  58 $t }
-function Herb  { param([string]$t) Paint  95 179 122 $t }
-function Blood { param([string]$t) Paint 201  72  75 $t }
-function Vitri { param([string]$t) Paint  74 166 184 $t }
-function Iris  { param([string]$t) Paint 138 110 168 $t }
-
-function Write-Tier {
-    param([string]$Name,[string]$Gloss)
-    $bar = '-' * [Math]::Max(4, 72 - $Name.Length - $Gloss.Length - 8)
-    Write-Host ''
-    Write-Host ("== " + (Iris $Name) + " " + (Dim $Gloss) + " " + (Dim $bar))
-}
-
-function Write-Step {
-    param([string]$Label,[string]$Status,[string]$Detail = '')
-    $glyph = switch ($Status) {
-        'ok'      { Herb  '[+]' }
-        'fixed'   { Vitri '[~]' }
-        'warn'    { Amber '[!]' }
-        'blocked' { Amber '[/]' }
-        'fail'    { Blood '[x]' }
-        'dry'     { Dim   '[.]' }
-        'skip'    { Dim   '[-]' }
-        default   { Dim   '[ ]' }
-    }
-    $pad = ($Label + ' ').PadRight(30, '.')
-    Write-Host ("   $glyph " + (Bone $pad) + ' ' + (Dim $Detail))
-    $null = $script:Ledger.Add([pscustomobject]@{
-        Tier = $script:CurrentTier; Step = $Label; Status = $Status; Detail = $Detail
-    })
-}
-
-function Add-Advisory {
-    param([string]$Title,[string]$Body)
-    $null = $script:Advisories.Add([pscustomobject]@{ Title = $Title; Body = $Body })
-}
-
-function Test-SkipKey {
+# ═══════════════════════════════════════════════════════════════
+#  COLOR ENGINE  —  VT-sniff, truecolor, ASCII fallback
+# ═══════════════════════════════════════════════════════════════
+$script:VT = $false
+if (-not $Alkahest.NoColor) {
     try {
-        if ([Console]::KeyAvailable) {
-            $k = [Console]::ReadKey($true)
-            if ($k.Key -eq 'S') { return $true }
-        }
-    } catch { }
-    return $false
+        if ($PSVersionTable.PSVersion.Major -ge 7) { $script:VT = $true }
+        elseif ($Host.UI.SupportsVirtualTerminal) { $script:VT = $true }
+    } catch { $script:VT = $false }
+}
+$e = [char]27
+function Paint {
+    param([string]$Text,[int[]]$Fg,[int[]]$Bg)
+    if (-not $script:VT) { return $Text }
+    $seq = ''
+    if ($Fg) { $seq += "$e[38;2;$($Fg[0]);$($Fg[1]);$($Fg[2])m" }
+    if ($Bg) { $seq += "$e[48;2;$($Bg[0]);$($Bg[1]);$($Bg[2])m" }
+    "$seq$Text$e[0m"
+}
+# shared apothecary palette — identical values to Panacea
+$Clr = @{
+    Orange = @(255,140,0)   # Rx warning
+    Green  = @(80,200,120)  # clear / healthy
+    Cyan   = @(90,190,220)  # dissolving / fixed
+    Grey   = @(120,120,120) # dim frame / skipped
+    Red    = @(220,50,50)   # failed
+    Black  = @(0,0,0)
+}
+if ($script:VT) {
+    $G = @{ Ok='[✓]'; Work='[»]'; Warn='[!]'; Fail='[✗]'; Skip='[~]'; Rx='℞'; Staff='⚕'; Bell='⚠' }
+} else {
+    $G = @{ Ok='[OK]'; Work='[>>]'; Warn='[!]'; Fail='[XX]'; Skip='[~]'; Rx='Rx'; Staff='+'; Bell='!!' }
 }
 
-#--- GUARDED PROCESS RUNNER ----------------------------------------------------
-# Synchronous char-level read. Deliberately NOT Register-ObjectEvent: that pattern
-# leaks subscriptions into the host runspace when anything between register and
-# unregister throws, which bit Panacea. This blocks on Read() instead, which also
-# lets DISM/SFC carriage-return progress bars render live.
+# ═══════════════════════════════════════════════════════════════
+#  RESULT LEDGER  —  every tier writes here; PROGNOSIS reads it
+# ═══════════════════════════════════════════════════════════════
+try { $ctxName = [Security.Principal.WindowsIdentity]::GetCurrent().Name } catch { $ctxName = 'unknown' }
+$script:Ledger = [ordered]@{
+    Host         = $env:COMPUTERNAME
+    Session      = -join ((48..57)+(97..102) | Get-Random -Count 6 | ForEach-Object {[char]$_})
+    Started      = Get-Date
+    Context      = $ctxName
+    OSBuild      = ''
+    UptimeDays   = 0
+    UptimeText   = ''
+    FreeGB       = 0.0
+    PandaPresent = $false
+    PendingBefore = New-Object System.Collections.Generic.List[string]
+    PendingAfter  = New-Object System.Collections.Generic.List[string]
+    Warnings     = New-Object System.Collections.Generic.List[string]
+    Symptoms     = New-Object System.Collections.Generic.List[string]
+    Proceed      = $true
+}
+
+function Rule($label) {
+    $line = ('─' * 62)
+    if (-not $script:VT) { $line = ('-' * 62) }
+    Write-Host ''
+    $suffix = if ($Alkahest.DryRun) { ' [DRY RUN]' } else { '' }
+    Write-Host (Paint "── $label$suffix $line" -Fg $Clr.Cyan)
+}
+function Status {
+    param([string]$Glyph,[string]$Label,[string]$Value,[int[]]$Color=$Clr.Grey)
+    $g = Paint $Glyph -Fg $Color
+    $dots = '.' * [Math]::Max(3, 20 - $Label.Length)
+    Write-Host "   $g $Label $dots $Value"
+}
+# grey indented prose, printed where the finding was made rather than hoarded
+# for the end. keeps the label short and loud, the way Panacea's is.
+function Note {
+    param([string[]]$Lines)
+    foreach ($l in $Lines) { Write-Host (Paint "       $l" -Fg $Clr.Grey) }
+}
+
+# ═══════════════════════════════════════════════════════════════
+#  BANNER  —  big wordmark into the Rx label frame
+# ═══════════════════════════════════════════════════════════════
+function Show-Banner {
+    $wm = @(
+        ' █████╗ ██╗    ██╗  ██╗ █████╗ ██╗  ██╗███████╗███████╗████████╗',
+        '██╔══██╗██║    ██║ ██╔╝██╔══██╗██║  ██║██╔════╝██╔════╝╚══██╔══╝',
+        '███████║██║    █████╔╝ ███████║███████║█████╗  ███████╗   ██║   ',
+        '██╔══██║██║    ██╔═██╗ ██╔══██║██╔══██║██╔══╝  ╚════██║   ██║   ',
+        '██║  ██║██████╗██║  ██╗██║  ██║██║  ██║███████╗███████║   ██║   ',
+        '╚═╝  ╚═╝╚═════╝╚═╝  ╚═╝╚═╝  ╚═╝╚═╝  ╚═╝╚══════╝╚══════╝   ╚═╝   '
+    )
+    $bar = '═' * 62; $mid = '─' * 62
+    if (-not $script:VT) { $bar = '=' * 62; $mid = '-' * 62 }
+    Write-Host (Paint "╔$bar╗" -Fg $Clr.Cyan)
+    foreach ($ln in $wm) { Write-Host (Paint $ln -Fg $Clr.Green) }
+    Write-Host ''
+    Write-Host (Paint "   $($G.Rx)  THE UNIVERSAL SOLVENT  ·  apothecary systems  ·  v$($Alkahest.Version)" -Fg $Clr.Cyan)
+    Write-Host (Paint "╟$mid╢" -Fg $Clr.Grey)
+    $d = Get-Date -Format 'yyyy-MM-dd HH:mm'
+    $inf = if ($script:VT) { [char]0x221E } else { 'unlimited' }
+    Write-Host (Paint "  RX # $($script:Ledger.Session.ToUpper())" -Fg $Clr.Grey) -NoNewline
+    Write-Host (Paint "            DATE: $d    REFILLS: $inf" -Fg $Clr.Grey)
+    Write-Host (Paint "  PATIENT: $($script:Ledger.Host)" -Fg $Clr.Grey)
+    Write-Host (Paint "  PRESCRIBER: $($script:Ledger.Context)" -Fg $Clr.Grey)
+    Write-Host (Paint "  DX: $($script:Ledger.OSBuild)" -Fg $Clr.Grey)
+    Write-Host (Paint "╚$bar╝" -Fg $Clr.Cyan)
+}
+
+# ═══════════════════════════════════════════════════════════════
+#  SETUP  —  interactive configure panel before the solvent runs.
+#             non-interactive contexts (SYSTEM/backstage) skip it.
+# ═══════════════════════════════════════════════════════════════
+$script:AlkahestAbort = $false
+function Show-Setup {
+    if (-not $Alkahest.ShowSetup) { return }
+    $interactive = $false
+    try { $interactive = -not [Console]::IsInputRedirected } catch { $interactive = $false }
+    if (-not $interactive) { return }
+
+    $inf = if ($script:VT) { [char]0x221E } else { 'unlimited' }
+    while ($true) {
+        $bar = '─' * 62
+        if (-not $script:VT) { $bar = '-' * 62 }
+        Write-Host ''
+        Write-Host (Paint "── DISPENSARY SETUP $bar" -Fg $Clr.Cyan)
+        Write-Host (Paint "   configure before the solvent runs · each line shows what will happen" -Fg $Clr.Grey)
+        Write-Host ''
+
+        if ($Alkahest.DryRun) {
+            $dryV = 'ON '; $dryHint = 'will only pretend — no changes made'
+        } else {
+            $dryV = 'OFF'; $dryHint = 'will make real changes when run'
+        }
+        if ($Alkahest.ServicingRepair) {
+            $svcV = 'ON '; $svcHint = 'will repair the component store if it looks sick'
+        } else {
+            $svcV = 'OFF'; $svcHint = 'will skip DISM RestoreHealth and SFC'
+        }
+        if ($Alkahest.RunWinSxS) {
+            $wsxV = 'ON '; $wsxHint = 'will trim Windows component store'
+        } else {
+            $wsxV = 'OFF'; $wsxHint = 'will skip component store cleanup'
+        }
+        if ($Alkahest.DismRestoreTimeoutSec -eq 0) {
+            $toV = "$inf   "; $toHint = 'no time limit — best for slow PCs'
+        } else {
+            $mins = [Math]::Round($Alkahest.DismRestoreTimeoutSec/60)
+            $toV = "{0,-4}m" -f $mins
+            $toHint = "kills stuck operations after $mins min"
+        }
+        if ($Alkahest.ClearPolicy) {
+            $polV = 'ON '; $polHint = 'will back up then REMOVE the GPO update keys'
+        } else {
+            $polV = 'OFF'; $polHint = 'will report update policy and leave it alone'
+        }
+        if ($Alkahest.ScheduleLocked) {
+            $lckV = 'ON '; $lckHint = 'will queue a locked cache rename for next boot'
+        } else {
+            $lckV = 'OFF'; $lckHint = 'will report a locked cache and move on'
+        }
+
+        Write-Host (Paint "   [1] DryRun ............ $dryV   $dryHint" -Fg $Clr.Grey)
+        Write-Host (Paint "   [2] Servicing repair .. $svcV   $svcHint" -Fg $Clr.Grey)
+        Write-Host (Paint "   [3] WinSxS cleanup .... $wsxV   $wsxHint" -Fg $Clr.Grey)
+        Write-Host (Paint "   [4] Timeouts .......... $toV  $toHint" -Fg $Clr.Grey)
+        Write-Host (Paint "   [5] Clear WU policy ... $polV   $polHint" -Fg $Clr.Grey)
+        Write-Host (Paint "   [6] Queue locked work . $lckV   $lckHint" -Fg $Clr.Grey)
+        Write-Host ''
+        Write-Host (Paint "   [Enter] proceed  ·  [Q] quit  ·  S skips any long step once running" -Fg $Clr.Cyan)
+        Write-Host (Paint "    > " -Fg $Clr.Cyan) -NoNewline
+        $c = [Console]::ReadLine()
+        if ($null -eq $c) { return }
+        $c = $c.Trim()
+
+        if ($c -eq '') { return }
+        elseif ($c -match '^[Qq]') {
+            Write-Host ''
+            Write-Host (Paint "   dispensary closed  ·  aborted at setup — nothing touched" -Fg $Clr.Grey)
+            $script:AlkahestAbort = $true
+            return
+        }
+        elseif ($c -eq '1') { $Alkahest.DryRun          = -not $Alkahest.DryRun }
+        elseif ($c -eq '2') { $Alkahest.ServicingRepair = -not $Alkahest.ServicingRepair }
+        elseif ($c -eq '3') { $Alkahest.RunWinSxS       = -not $Alkahest.RunWinSxS }
+        elseif ($c -eq '6') { $Alkahest.ScheduleLocked  = -not $Alkahest.ScheduleLocked }
+        elseif ($c -eq '4') {
+            if ($Alkahest.DismRestoreTimeoutSec -eq 0) {
+                $Alkahest.DismCheckTimeoutSec   = 300
+                $Alkahest.DismRestoreTimeoutSec = 1800
+                $Alkahest.SfcTimeoutSec         = 1800
+                $Alkahest.WinSxSTimeoutSec      = 1800
+                $Alkahest.PkgScanTimeoutSec     = 600
+            } elseif ($Alkahest.DismRestoreTimeoutSec -le 1800) {
+                $Alkahest.DismCheckTimeoutSec   = 600
+                $Alkahest.DismRestoreTimeoutSec = 3600
+                $Alkahest.SfcTimeoutSec         = 3600
+                $Alkahest.WinSxSTimeoutSec      = 3600
+                $Alkahest.PkgScanTimeoutSec     = 900
+            } else {
+                $Alkahest.DismCheckTimeoutSec   = 0
+                $Alkahest.DismRestoreTimeoutSec = 0
+                $Alkahest.SfcTimeoutSec         = 0
+                $Alkahest.WinSxSTimeoutSec      = 0
+                $Alkahest.PkgScanTimeoutSec     = 0
+            }
+        }
+        elseif ($c -eq '5') {
+            if (-not $Alkahest.ClearPolicy) {
+                Write-Host ''
+                Write-Host (Paint "   This client may point at WSUS on purpose." -Fg $Clr.Orange)
+                Write-Host (Paint "   AD GPO rewrites this key on its own cycle. MDM is NOT documented to" -Fg $Clr.Orange)
+                Write-Host (Paint "   re-push a value deleted locally, so assume the .reg backup is the" -Fg $Clr.Orange)
+                Write-Host (Paint "   only way back. Intune Update rings live elsewhere and are untouched." -Fg $Clr.Orange)
+                Write-Host (Paint "   type CLEAR to arm it > " -Fg $Clr.Orange) -NoNewline
+                $y = [Console]::ReadLine()
+                if ($y -and $y.Trim() -ceq 'CLEAR') { $Alkahest.ClearPolicy = $true }
+            } else { $Alkahest.ClearPolicy = $false }
+        }
+    }
+}
+
+# ═══════════════════════════════════════════════════════════════
+#  GUARDED RUNNER  —  same contract as Panacea's, same skin.
+#  Register-ObjectEvent with try/finally unregister, so no orphan
+#  subscriptions outlive the scriptblock and pollute the host.
+# ═══════════════════════════════════════════════════════════════
 function Invoke-Guarded {
     param(
-        [Parameter(Mandatory=$true)][string]$FilePath,
-        [string]$Arguments = '',
-        [Parameter(Mandatory=$true)][string]$Label,
-        [int]$TimeoutSec = -1,
-        [switch]$Quiet
+        [string]$File,
+        [string]$Arguments,
+        [int]$TimeoutSec = 0,
+        [string]$Label = '',
+        [switch]$ShowNative   # let stdout flow to console (native DISM/SFC progress bar)
     )
-    if ($TimeoutSec -lt 0) { $TimeoutSec = $script:Cfg.TimeoutSec }
-    if ($script:Cfg.DryRun) {
-        Write-Step $Label 'dry' "would run: $FilePath $Arguments"
-        return [pscustomobject]@{ ExitCode = 0; Output = ''; Skipped = $true; TimedOut = $false }
-    }
+    $canSkip = $false
+    try { $canSkip = -not [Console]::IsInputRedirected } catch { $canSkip = $false }
 
     $psi = New-Object System.Diagnostics.ProcessStartInfo
-    $psi.FileName               = $FilePath
-    $psi.Arguments              = $Arguments
-    $psi.UseShellExecute        = $false
-    $psi.RedirectStandardOutput = $true
-    $psi.RedirectStandardError  = $true
-    $psi.CreateNoWindow         = $true
-
-    $p  = New-Object System.Diagnostics.Process
+    $psi.FileName = $File
+    $psi.Arguments = $Arguments
+    $psi.UseShellExecute = $false
+    if ($ShowNative) {
+        $psi.RedirectStandardOutput = $false
+        $psi.RedirectStandardError  = $true
+        $psi.CreateNoWindow = $false
+    } else {
+        $psi.RedirectStandardOutput = $true
+        $psi.RedirectStandardError  = $true
+        $psi.CreateNoWindow = $true
+    }
+    $p = New-Object System.Diagnostics.Process
     $p.StartInfo = $psi
-    $all  = New-Object System.Text.StringBuilder
-    $line = New-Object System.Text.StringBuilder
-    $timedOut = $false
-    $bailed   = $false
+    $sbOut = New-Object System.Text.StringBuilder
+    $sbErr = New-Object System.Text.StringBuilder
 
-    Write-Host ("   " + (Dim "> $Label") + (Dim "   (S = skip this step)"))
-    $null = $p.Start()
-    $sw = [System.Diagnostics.Stopwatch]::StartNew()
+    $outEvt = $null
+    if (-not $ShowNative) {
+        $outEvt = Register-ObjectEvent -InputObject $p -EventName OutputDataReceived -Action {
+            if ($EventArgs.Data) { [void]$Event.MessageData.AppendLine($EventArgs.Data) }
+        } -MessageData $sbOut
+    }
+    $errEvt = Register-ObjectEvent -InputObject $p -EventName ErrorDataReceived -Action {
+        if ($EventArgs.Data) { [void]$Event.MessageData.AppendLine($EventArgs.Data) }
+    } -MessageData $sbErr
 
+    if ($ShowNative -and $canSkip) {
+        Write-Host (Paint "      (press S at any time to skip)" -Fg $Clr.Grey)
+    }
+
+    $code = -1; $skipped = $false; $timedOut = $false
     try {
-        while ($true) {
-            $c = $p.StandardOutput.Read()
-            if ($c -lt 0) { break }
-            $ch = [char]$c
-            if ($ch -eq "`r" -or $ch -eq "`n") {
-                $text = $line.ToString().Trim()
-                $null = $line.Clear()
-                if ($text.Length -gt 0) {
-                    $null = $all.AppendLine($text)
-                    if (-not $Quiet) { Write-Host ("     " + (Dim $text)) }
-                }
-            } else {
-                $null = $line.Append($ch)
+        [void]$p.Start()
+        if (-not $ShowNative) { $p.BeginOutputReadLine() }
+        $p.BeginErrorReadLine()
+
+        if ($script:VT) { $frames = @([char]0x280B,[char]0x2819,[char]0x2839,[char]0x2838,[char]0x283C,[char]0x2834,[char]0x2826,[char]0x2827,[char]0x2807,[char]0x280F) }
+        else            { $frames = @('|','/','-','\') }
+
+        $sw = [System.Diagnostics.Stopwatch]::StartNew()
+        $frameIdx = 0
+
+        while (-not $p.HasExited) {
+            if ($TimeoutSec -gt 0 -and $sw.Elapsed.TotalSeconds -ge $TimeoutSec) { $timedOut = $true; try { $p.Kill() } catch {}; break }
+            if ($canSkip) {
+                try {
+                    if ([Console]::KeyAvailable) {
+                        $k = [Console]::ReadKey($true)
+                        if ($k.KeyChar -eq 's' -or $k.KeyChar -eq 'S') {
+                            $skipped = $true
+                            try { $p.Kill() } catch {}
+                            break
+                        }
+                    }
+                } catch {}
             }
-            if (Test-SkipKey) { $bailed = $true; break }
-            if ($TimeoutSec -gt 0 -and $sw.Elapsed.TotalSeconds -gt $TimeoutSec) { $timedOut = $true; break }
+            if (-not $ShowNative) {
+                $elapsed = "{0:mm\:ss}" -f $sw.Elapsed
+                $spin = $frames[$frameIdx % $frames.Count]
+                $hint = if ($canSkip) { 'press S to skip' } else { 'running' }
+                $lbl  = if ($Label) { $Label } else { 'working' }
+                $line = "      $spin  $lbl  ·  $elapsed elapsed  ·  $hint"
+                try { [Console]::Write("`r" + $line.PadRight(70)) } catch {}
+                $frameIdx++
+            }
+            Start-Sleep -Milliseconds 250
+        }
+        if (-not $ShowNative) {
+            try { [Console]::Write("`r" + (' ' * 72) + "`r") } catch {}
+        } else {
+            Write-Host ''
         }
 
-        if ($bailed -or $timedOut) {
-            try { if (-not $p.HasExited) { $p.Kill() } } catch { }
-            $status = if ($bailed) { 'skip' } else { 'warn' }
-            $why    = if ($bailed) { 'skipped by operator' } else { "timed out after ${TimeoutSec}s" }
-            Write-Step $Label $status $why
-            return [pscustomobject]@{ ExitCode = -1; Output = $all.ToString(); Skipped = $true; TimedOut = $timedOut }
-        }
-
-        $p.WaitForExit()
-        $err = ''
-        try { $err = $p.StandardError.ReadToEnd() } catch { }
-        if ($err) { $null = $all.AppendLine($err.Trim()) }
-        return [pscustomobject]@{ ExitCode = $p.ExitCode; Output = $all.ToString(); Skipped = $false; TimedOut = $false }
+        Start-Sleep -Milliseconds 200
+        $code = if ($skipped -or $timedOut) { -1 } else { try { $p.ExitCode } catch { -1 } }
     }
     finally {
-        try { $p.Dispose() } catch { }
+        if (-not $ShowNative -and $outEvt) {
+            Unregister-Event -SourceIdentifier $outEvt.Name -ErrorAction SilentlyContinue
+            Remove-Job -Job $outEvt -Force -ErrorAction SilentlyContinue
+        }
+        if ($errEvt) {
+            Unregister-Event -SourceIdentifier $errEvt.Name -ErrorAction SilentlyContinue
+            Remove-Job -Job $errEvt -Force -ErrorAction SilentlyContinue
+        }
+        try { if (-not $p.HasExited) { $p.Kill() } } catch {}
+        try { $p.Dispose() } catch {}
+    }
+
+    [pscustomobject]@{
+        ExitCode = $code
+        TimedOut = $timedOut
+        Skipped  = $skipped
+        StdOut   = $sbOut.ToString()
+        StdErr   = $sbErr.ToString()
     }
 }
 
-#--- SMALL HELPERS -------------------------------------------------------------
-function Test-Admin {
-    try {
-        $id = [Security.Principal.WindowsIdentity]::GetCurrent()
-        (New-Object Security.Principal.WindowsPrincipal $id).IsInRole(
-            [Security.Principal.WindowsBuiltInRole]::Administrator)
-    } catch { $false }
-}
-
-function Get-FreeGB {
-    param([string]$Drive = $env:SystemDrive)
-    try {
-        $d = Get-CimInstance Win32_LogicalDisk -Filter ("DeviceID='{0}'" -f $Drive) -ErrorAction Stop
-        [math]::Round($d.FreeSpace / 1GB, 1)
-    } catch { -1 }
-}
-
-function Get-RegValue {
-    param([string]$Path,[string]$Name)
+# ═══════════════════════════════════════════════════════════════
+#  SMALL HELPERS
+# ═══════════════════════════════════════════════════════════════
+function Get-RegValue($Path,$Name) {
     try { (Get-ItemProperty -Path $Path -Name $Name -ErrorAction Stop).$Name } catch { $null }
 }
-
-function Get-DirSizeGB {
-    param([string]$Path)
+function Get-DirSizeGB($path) {
     try {
-        if (-not (Test-Path -LiteralPath $Path)) { return 0 }
-        $m = Get-ChildItem -LiteralPath $Path -Recurse -Force -File -ErrorAction SilentlyContinue |
+        if (-not (Test-Path -LiteralPath $path)) { return 0 }
+        $m = Get-ChildItem -LiteralPath $path -Recurse -Force -File -ErrorAction SilentlyContinue |
              Measure-Object -Property Length -Sum
         if ($null -eq $m -or $null -eq $m.Sum) { return 0 }
-        [math]::Round($m.Sum / 1GB, 2)
+        [Math]::Round($m.Sum/1GB,2)
     } catch { 0 }
 }
 
-$script:SvcList = @(
-    @{ Name='wuauserv';     Nice='Windows Update';        Want='Manual'    },
-    @{ Name='bits';         Nice='BITS';                  Want='Manual'    },
-    @{ Name='cryptsvc';     Nice='Cryptographic Svc';     Want='Automatic' },
-    @{ Name='msiserver';    Nice='Windows Installer';     Want='Manual'    },
-    @{ Name='UsoSvc';       Nice='Update Orchestrator';   Want='Manual'    },
-    @{ Name='DoSvc';        Nice='Delivery Optimization'; Want='Manual'    },
-    @{ Name='TrustedInstaller'; Nice='Windows Modules';   Want='Manual'    }
+$script:SvcSpec = @(
+    @{ Name='wuauserv';         Nice='windows update';   Want='Manual'    },
+    @{ Name='bits';             Nice='BITS';             Want='Manual'    },
+    @{ Name='cryptsvc';         Nice='cryptographic';    Want='Automatic' },
+    @{ Name='msiserver';        Nice='windows installer';Want='Manual'    },
+    @{ Name='UsoSvc';           Nice='orchestrator';     Want='Manual'    },
+    @{ Name='DoSvc';            Nice='delivery opt';     Want='Manual'    },
+    @{ Name='TrustedInstaller'; Nice='windows modules';  Want='Manual'    }
 )
+$script:SvcState = @{}
 
-function Stop-UpdateService {
-    param([string]$ServiceName,[string]$Nice)
-    try {
-        $s = Get-Service -Name $ServiceName -ErrorAction Stop
-    } catch {
-        Write-Step $Nice 'skip' 'service not present on this build'
-        return
-    }
-    $script:SvcPrior[$ServiceName] = $s.Status
-    if ($s.Status -eq 'Stopped') { Write-Step $Nice 'ok' 'already stopped'; return }
-    if ($script:Cfg.DryRun) { Write-Step $Nice 'dry' 'would stop'; return }
+function Stop-UpdateService($Name,$Nice) {
+    try { $s = Get-Service -Name $Name -ErrorAction Stop }
+    catch { Status $G.Skip $Nice 'not present on this build' $Clr.Grey; return }
+    if ($s.Status -eq 'Stopped') { Status $G.Ok $Nice 'already stopped' $Clr.Green; return }
+    if ($Alkahest.DryRun)        { Status $G.Skip $Nice 'would stop' $Clr.Grey; return }
     for ($i = 1; $i -le 3; $i++) {
         try {
-            Stop-Service -Name $ServiceName -Force -ErrorAction Stop
+            Stop-Service -Name $Name -Force -ErrorAction Stop
             Start-Sleep -Milliseconds 700
-            $s.Refresh()
-            if ((Get-Service $ServiceName).Status -eq 'Stopped') {
-                Write-Step $Nice 'fixed' 'stopped'
-                return
-            }
-        } catch {
-            Start-Sleep -Seconds 2
-        }
+            if ((Get-Service $Name).Status -eq 'Stopped') { Status $G.Work $Nice 'stopped' $Clr.Cyan; return }
+        } catch { Start-Sleep -Seconds ($i * 2) }
     }
-    Write-Step $Nice 'blocked' 'would not stop - see advisories'
-    Add-Advisory "$Nice would not stop" @"
-Three attempts to stop $ServiceName were refused. On a Panda Adaptive Defense box
-this is usually the endpoint agent holding the service or its files open mid-scan.
-It is not fatal: the cache rename below will simply report BLOCKED and the
-servicing repair still runs. Retrying after the box has been idle for a few
-minutes, or after a reboot, generally clears it.
-"@
+    Status $G.Warn $Nice 'would not stop' $Clr.Orange
+    Note @(
+        'three attempts refused. on a Panda box this is usually the endpoint agent',
+        'holding the service or its files open mid-scan. not fatal — the cache',
+        'rename below will report locked and the servicing repair still runs.'
+    )
+    $script:Ledger.Symptoms.Add("$Name would not stop")
 }
 
-function Rename-Stale {
-    param([string]$Path,[string]$Nice)
-    if (-not (Test-Path -LiteralPath $Path)) { Write-Step $Nice 'skip' 'not present'; return $false }
-    $target = "$Path.old.$($script:Stamp)"
-    if ($script:Cfg.DryRun) { Write-Step $Nice 'dry' "would rename -> $(Split-Path $target -Leaf)"; return $false }
+function Rename-Stale($Path,$Nice) {
+    if (-not (Test-Path -LiteralPath $Path)) { Status $G.Skip $Nice 'not present' $Clr.Grey; return $false }
+    $leaf = (Split-Path $Path -Leaf) + '.old.' + (Get-Date -Format 'yyyyMMdd_HHmmss')
+    if ($Alkahest.DryRun) { Status $G.Skip $Nice "would rename → $leaf" $Clr.Grey; return $false }
     for ($i = 1; $i -le 4; $i++) {
         try {
-            Rename-Item -LiteralPath $Path -NewName (Split-Path $target -Leaf) -ErrorAction Stop
-            Write-Step $Nice 'fixed' "renamed -> $(Split-Path $target -Leaf)"
+            Rename-Item -LiteralPath $Path -NewName $leaf -ErrorAction Stop
+            Status $G.Work $Nice "renamed → $leaf" $Clr.Cyan
             return $true
-        } catch {
-            Start-Sleep -Seconds ($i * 2)
-        }
+        } catch { Start-Sleep -Seconds ($i * 2) }
     }
-    Write-Step $Nice 'blocked' 'locked - not renamed, nothing deleted'
+    Status $G.Warn $Nice 'locked — not renamed, nothing deleted' $Clr.Orange
     return $false
 }
 
-#--- SETUP PANEL ---------------------------------------------------------------
-function Show-Setup {
-    $interactive = $true
-    try { $null = [Console]::KeyAvailable } catch { $interactive = $false }
+# ═══════════════════════════════════════════════════════════════
+#  DIAGNOSE  —  read the blockage before touching it
+# ═══════════════════════════════════════════════════════════════
 
-    function OnOff { param($b) if ($b) { Herb 'on ' } else { Dim 'off' } }
-    function Timeout-Label { if ($script:Cfg.TimeoutSec -le 0) { 'infinite' } else { "$($script:Cfg.TimeoutSec)s" } }
+# OS build first so the banner DX line is populated before we print it
+try {
+    $os  = Get-CimInstance Win32_OperatingSystem -ErrorAction Stop
+    $cv  = Get-ItemProperty 'HKLM:\SOFTWARE\Microsoft\Windows NT\CurrentVersion' -ErrorAction SilentlyContinue
+    $disp = if ($cv.DisplayVersion) { $cv.DisplayVersion } else { $cv.ReleaseId }
+    $script:Ledger.OSBuild = "$($os.Caption.Replace('Microsoft ','')) $disp (build $($cv.CurrentBuildNumber).$($cv.UBR))"
+    $script:Ledger.UptimeDays = [Math]::Round(((Get-Date) - $os.LastBootUpTime).TotalDays,1)
+    $script:Ledger.UptimeText = "$($script:Ledger.UptimeDays) days"
+} catch { $script:Ledger.OSBuild = 'Windows (build detection failed)' }
 
-    while ($true) {
-        Write-Host ''
-        Write-Host (Dim '   .-- PREPARATION ------------------------------------------------------.')
-        Write-Host ('   ' + (Bone '[1] Dry run ............ ') + (OnOff $script:Cfg.DryRun)      + (Dim '   narrate every action, change nothing'))
-        Write-Host ('   ' + (Bone '[2] Step timeout ....... ') + (Bone (Timeout-Label))         + (Dim '   how long one operation may run before it is cut'))
-        Write-Host ('   ' + (Bone '[3] Servicing repair ... ') + (OnOff $script:Cfg.ServicingRepair) + (Dim '   run DISM RestoreHealth and SFC if the image is sick'))
-        Write-Host ('   ' + (Bone '[4] Component cleanup .. ') + (OnOff $script:Cfg.ComponentCleanup) + (Dim '   reclaim superseded WinSxS payloads (slow, safe)'))
-        Write-Host ('   ' + (Bone '[5] Clear WU policy .... ') + (OnOff $script:Cfg.ClearPolicyKeys)  + (Dim '   backs up, then removes WSUS/GPO update keys'))
-        Write-Host ('   ' + (Bone '[6] Queue locked work .. ') + (OnOff $script:Cfg.ScheduleLocked)   + (Dim '   if a cache is locked, rename it on next boot instead'))
-        Write-Host (Dim   "   '-- S at any point during a long step skips that step ----------------'")
-        Write-Host ('   ' + (Dim 'number toggles - ') + (Herb 'ENTER') + (Dim ' begins'))
-        Write-Host ''
-
-        if (-not $interactive) {
-            Write-Host ('   ' + (Dim 'no console input available - running with defaults'))
-            return
-        }
-        $choice = Read-Host '   >'
-        switch ($choice.Trim()) {
-            ''  { return }
-            '1' { $script:Cfg.DryRun           = -not $script:Cfg.DryRun }
-            '3' { $script:Cfg.ServicingRepair  = -not $script:Cfg.ServicingRepair }
-            '4' { $script:Cfg.ComponentCleanup = -not $script:Cfg.ComponentCleanup }
-            '6' { $script:Cfg.ScheduleLocked   = -not $script:Cfg.ScheduleLocked }
-            '2' {
-                $v = Read-Host '   seconds per step (0 = infinite)'
-                $n = 0
-                if ([int]::TryParse($v, [ref]$n) -and $n -ge 0) { $script:Cfg.TimeoutSec = $n }
-            }
-            '5' {
-                if (-not $script:Cfg.ClearPolicyKeys) {
-                    Write-Host ('   ' + (Amber 'This client may point at WSUS on purpose. AD GPO rewrites this key on'))
-                    Write-Host ('   ' + (Amber 'its own cycle; MDM is NOT documented to re-push a locally deleted value.'))
-                    Write-Host ('   ' + (Amber 'Assume the .reg backup is the only way back until proven otherwise.'))
-                    $y = Read-Host '   type CLEAR to arm it'
-                    if ($y -eq 'CLEAR') { $script:Cfg.ClearPolicyKeys = $true }
-                } else { $script:Cfg.ClearPolicyKeys = $false }
-            }
-        }
-    }
-}
-
-#--- LABEL -------------------------------------------------------------------
-function Show-Label {
-    param([string]$Verdict,[int[]]$VerdictColor)
-    $w = @(
-        '  █████╗ ██╗     ██╗  ██╗ █████╗ ██╗  ██╗███████╗███████╗████████╗',
-        ' ██╔══██╗██║     ██║ ██╔╝██╔══██╗██║  ██║██╔════╝██╔════╝╚══██╔══╝',
-        ' ███████║██║     █████╔╝ ███████║███████║█████╗  ███████╗   ██║   ',
-        ' ██╔══██║██║     ██╔═██╗ ██╔══██║██╔══██║██╔══╝  ╚════██║   ██║   ',
-        ' ██║  ██║███████╗██║  ██╗██║  ██║██║  ██║███████╗███████║   ██║   ',
-        ' ╚═╝  ╚═╝╚══════╝╚═╝  ╚═╝╚═╝  ╚═╝╚═╝  ╚═╝╚══════╝╚══════╝   ╚═╝   '
-    )
-    Write-Host ''
-    Write-Host (Dim ('   ' + '=' * 68))
-    foreach ($l in $w) { Write-Host ('  ' + (Iris $l)) }
-    Write-Host ('   ' + (Bone 'Rx  THE UNIVERSAL SOLVENT') + (Dim '  .  apothecary systems  .  v') + (Dim $script:Version))
-    Write-Host (Dim ('   ' + '-' * 68))
-    Write-Host ('   ' + (Dim 'RX #    ') + (Bone $script:Stamp.Substring(9)) + (Dim '        DATE: ') + (Bone $script:Started.ToString('yyyy-MM-dd HH:mm')))
-    Write-Host ('   ' + (Dim 'PATIENT ') + (Bone $env:COMPUTERNAME))
-    Write-Host ('   ' + (Dim 'PRESCRIBER ') + (Bone "$env:USERDOMAIN\$env:USERNAME"))
-    Write-Host ('   ' + (Dim 'DX      ') + (Bone $script:OsCaption) + (Dim ("  (build {0})" -f $script:OsBuild)))
-    Write-Host ('   ' + (Dim 'SIG     ') + (Paint $VerdictColor[0] $VerdictColor[1] $VerdictColor[2] $Verdict))
-    Write-Host (Dim ('   ' + '=' * 68))
-}
-
-#--- TIER 1: DIAGNOSE ----------------------------------------------------------
-function Invoke-Diagnose {
-    $script:CurrentTier = 'DIAGNOSE'
-    Write-Tier 'DIAGNOSE' 'read the blockage before touching it'
-
-    $script:IsAdmin = Test-Admin
-    if ($script:IsAdmin) { Write-Step 'elevation' 'ok' 'Administrator' }
-    else {
-        Write-Step 'elevation' 'fail' 'not elevated - nothing can be repaired'
-        return $false
-    }
-
-    try {
-        $os = Get-CimInstance Win32_OperatingSystem -ErrorAction Stop
-        $script:OsCaption = $os.Caption.Trim()
-        $script:OsBuild   = $os.BuildNumber
-        $upDays = [math]::Round(((Get-Date) - $os.LastBootUpTime).TotalDays, 1)
-        Write-Step 'operating system' 'ok' "$($script:OsCaption) - build $($script:OsBuild)"
-        $script:UptimeDays = $upDays
-        if ($upDays -gt 14) { Write-Step 'uptime' 'warn' "$upDays days - a pending servicing op may just need the reboot" }
-        else                { Write-Step 'uptime' 'ok'   "$upDays days" }
-    } catch {
-        $script:OsCaption = 'unknown'; $script:OsBuild = '0'; $script:UptimeDays = 0
-        Write-Step 'operating system' 'warn' 'could not read Win32_OperatingSystem'
-    }
-
-    $script:FreeGB = Get-FreeGB
-    if     ($script:FreeGB -lt 0)  { Write-Step 'disk headroom' 'warn' 'unreadable' }
-    elseif ($script:FreeGB -lt 10) { Write-Step 'disk headroom' 'fail' "$($script:FreeGB) GB free - updates will fail below ~10 GB"
-                                     Add-Advisory 'Not enough free space' "Feature and cumulative updates stage into $env:SystemDrive and routinely need 10-20 GB. At $($script:FreeGB) GB the update will keep failing no matter what is reset here. Panacea's PURGE tier is the right tool for that half of the job." }
-    elseif ($script:FreeGB -lt 20) { Write-Step 'disk headroom' 'warn' "$($script:FreeGB) GB free - tight for a feature update" }
-    else                           { Write-Step 'disk headroom' 'ok'   "$($script:FreeGB) GB free" }
-
-    # --- endpoint protection: name it, because it changes what will work
-    $script:Panda = $false
-    $pandaHits = @()
-    foreach ($sn in @('PandaAetherAgent','PSUAService','NanoServiceMain','PandaSecurityService','PandaAgent')) {
-        try { if (Get-Service -Name $sn -ErrorAction Stop) { $pandaHits += $sn } } catch { }
-    }
-    if (Test-Path 'HKLM:\SOFTWARE\Panda Security') { $pandaHits += 'registry' }
-    if (Test-Path 'HKLM:\SOFTWARE\WOW6432Node\Panda Security') { $pandaHits += 'registry(x86)' }
-    if ($pandaHits.Count -gt 0) {
-        $script:Panda = $true
-        Write-Step 'endpoint protection' 'warn' ("Panda present ({0})" -f ($pandaHits -join ', '))
-        Add-Advisory 'Panda Adaptive Defense is on this box' @"
-Two things follow from that, and both are already handled:
-  1. The classic "reset Windows Update" recipe re-registers a dozen DLLs with
-     regsvr32 and drives BITS with bitsadmin. Panda blocks or quarantines both.
-     ALKAHEST does not use either. If a hand-run of the old recipe is what got
-     this machine here, the aborted half of it is likely part of the blockage.
-  2. Panda holds file handles inside SoftwareDistribution while it scans staged
-     payloads, so a rename can come back access-denied. Renames retry four times
-     with backoff and then report BLOCKED rather than forcing anything.
-"@
-    } else {
-        Write-Step 'endpoint protection' 'ok' 'no Panda signature found'
-    }
-
-    # --- service posture
-    $script:SvcState = @{}
-    foreach ($svc in $script:SvcList) {
-        try {
-            $s = Get-Service -Name $svc.Name -ErrorAction Stop
-            $wmi = Get-CimInstance Win32_Service -Filter ("Name='{0}'" -f $svc.Name) -ErrorAction SilentlyContinue
-            $start = if ($wmi) { $wmi.StartMode } else { 'unknown' }
-            $script:SvcState[$svc.Name] = [pscustomobject]@{ Status = $s.Status; StartMode = $start }
-            if ($start -eq 'Disabled') {
-                Write-Step $svc.Nice 'fail' "DISABLED (status $($s.Status)) - this alone stops updates"
-            } else {
-                Write-Step $svc.Nice 'ok' "$($s.Status) / $start"
-            }
-        } catch {
-            Write-Step $svc.Nice 'skip' 'not present on this build'
-        }
-    }
-    try {
-        $medic = Get-Service -Name 'WaaSMedicSvc' -ErrorAction Stop
-        Write-Step 'Update Medic' 'warn' "$($medic.Status) - reverts manual WU changes by design"
-    } catch { }
-
-    # --- pending reboot / pending servicing
-    $script:Pending = @()
-    if (Test-Path 'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Component Based Servicing\RebootPending') { $script:Pending += 'CBS RebootPending' }
-    if (Test-Path 'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Component Based Servicing\PackagesPending') { $script:Pending += 'CBS PackagesPending' }
-    if (Test-Path 'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\WindowsUpdate\Auto Update\RebootRequired') { $script:Pending += 'WU RebootRequired' }
-    if (Get-RegValue 'HKLM:\SYSTEM\CurrentControlSet\Control\Session Manager' 'PendingFileRenameOperations') { $script:Pending += 'PendingFileRenameOperations' }
-    foreach ($x in @('pending.xml','reboot.xml','SessionsPending.xml')) {
-        $p = Join-Path $env:windir "WinSxS\$x"
-        if (Test-Path -LiteralPath $p) { $script:Pending += "WinSxS\$x" }
-    }
-    if ($script:Pending.Count -gt 0) {
-        Write-Step 'pending servicing' 'warn' ($script:Pending -join ', ')
-        Add-Advisory 'A servicing transaction is already staged' @"
-$($script:Pending -join ', ')
-
-These are read-only findings and ALKAHEST does not touch them. A staged CBS
-transaction completes on the next restart; clearing it by hand is how a machine
-gets a half-installed component store. If this box also shows high uptime, the
-honest first move is a scheduled reboot, not a reset.
-"@
-    } else {
-        Write-Step 'pending servicing' 'ok' 'nothing staged'
-    }
-
-    # --- cache footprint
-    $script:SdPath  = Join-Path $env:windir 'SoftwareDistribution'
-    $script:CatPath = Join-Path $env:windir 'System32\catroot2'
-    $sdGB = Get-DirSizeGB $script:SdPath
-    $dl   = Join-Path $script:SdPath 'Download'
-    $oldest = $null
-    try {
-        $f = Get-ChildItem -LiteralPath $dl -Recurse -Force -File -ErrorAction SilentlyContinue |
-             Sort-Object LastWriteTime | Select-Object -First 1
-        if ($f) { $oldest = [math]::Round(((Get-Date) - $f.LastWriteTime).TotalDays, 1) }
-    } catch { }
-    $sdNote = "$sdGB GB"
-    if ($null -ne $oldest) { $sdNote += " - oldest staged payload $oldest days old" }
-    if ($null -ne $oldest -and $oldest -gt 7) { Write-Step 'SoftwareDistribution' 'warn' $sdNote }
-    else { Write-Step 'SoftwareDistribution' 'ok' $sdNote }
-
-    # --- BITS queue
-    $script:BitsJobs = 0
-    if (Get-Command Get-BitsTransfer -ErrorAction SilentlyContinue) {
-        try {
-            $jobs = @(Get-BitsTransfer -AllUsers -ErrorAction Stop)
-            $script:BitsJobs = $jobs.Count
-            $stuck = @($jobs | Where-Object { $_.JobState -in @('Error','TransientError','Suspended') })
-            if ($stuck.Count -gt 0) { Write-Step 'BITS queue' 'warn' "$($jobs.Count) jobs, $($stuck.Count) errored/suspended" }
-            elseif ($jobs.Count -gt 0) { Write-Step 'BITS queue' 'ok' "$($jobs.Count) jobs, none errored" }
-            else { Write-Step 'BITS queue' 'ok' 'empty' }
-        } catch { Write-Step 'BITS queue' 'warn' 'unreadable (BITS may be stopped)' }
-    } else { Write-Step 'BITS queue' 'skip' 'BitsTransfer cmdlets unavailable' }
-
-    # --- policy: report, never assume it is wrong
-    $polPath = 'HKLM:\SOFTWARE\Policies\Microsoft\Windows\WindowsUpdate'
-    $script:Policy = @{}
-    if (Test-Path $polPath) {
-        foreach ($n in @('WUServer','WUStatusServer','TargetGroup','DoNotConnectToWindowsUpdateInternetLocations','DisableWindowsUpdateAccess','SetPolicyDrivenUpdateSourceForFeatureUpdates')) {
-            $v = Get-RegValue $polPath $n
-            if ($null -ne $v) { $script:Policy[$n] = $v }
-        }
-        $au = Get-RegValue "$polPath\AU" 'UseWUServer'
-        if ($null -ne $au) { $script:Policy['UseWUServer'] = $au }
-    }
-    if ($script:Policy.Count -gt 0) {
-        Write-Step 'update policy' 'warn' (($script:Policy.Keys | Sort-Object) -join ', ')
-        $wsus = $script:Policy['WUServer']
-        if ($wsus) {
-            $reach = 'not tested'
-            try {
-                $u = [uri]$wsus
-                $port = if ($u.Port -gt 0) { $u.Port } else { if ($u.Scheme -eq 'https') { 443 } else { 80 } }
-                $t = Test-NetConnection -ComputerName $u.Host -Port $port -InformationLevel Quiet -WarningAction SilentlyContinue
-                $reach = if ($t) { 'reachable' } else { 'UNREACHABLE' }
-            } catch { $reach = 'could not test' }
-            Write-Step 'WSUS endpoint' $(if ($reach -eq 'UNREACHABLE') { 'fail' } else { 'ok' }) "$wsus - $reach"
-            if ($reach -eq 'UNREACHABLE') {
-                Add-Advisory 'WSUS is configured and not answering' @"
-$wsus
-
-This machine is pointed at a WSUS server it cannot reach, which produces exactly
-the symptom being chased: scans that never finish and updates that never move.
-No amount of cache clearing fixes it. Confirm with whoever owns that tenant's
-patching before changing anything - the fix is on the server or the network path,
-not on this endpoint.
-"@
-            }
-        }
-    } else {
-        Write-Step 'update policy' 'ok' 'no WSUS/GPO update keys set'
-    }
-
-    # Intune Update rings do not live in the Policies key above. Read the MDM
-    # path too, or a ring-managed box reports "no policy" and lies to the tech.
-    $mdmPath = 'HKLM:\SOFTWARE\Microsoft\PolicyManager\default\Update'
-    $script:MdmPolicy = @()
-    if (Test-Path $mdmPath) {
-        try {
-            $script:MdmPolicy = @(Get-ChildItem -Path $mdmPath -ErrorAction Stop |
-                Select-Object -ExpandProperty PSChildName)
-        } catch { }
-    }
-    if ($script:MdmPolicy.Count -gt 0) {
-        Write-Step 'MDM update policy' 'warn' ("{0} settings under PolicyManager (Intune ring or similar)" -f $script:MdmPolicy.Count)
-        Add-Advisory 'This box is under MDM update policy' @"
-$(($script:MdmPolicy | Sort-Object | Select-Object -First 12) -join ', ')
-
-Read from HKLM\SOFTWARE\Microsoft\PolicyManager\default\Update. ALKAHEST does
-not touch this key and the "Clear WU policy" option does not either - that option
-only clears HKLM\SOFTWARE\Policies\Microsoft\Windows\WindowsUpdate.
-
-Deferrals, pauses and a target release version set here will hold updates back and
-look exactly like a stuck stack. Check the assigned ring in Intune before chasing
-this any further on the endpoint.
-"@
-    } else {
-        Write-Step 'MDM update policy' 'ok' 'no PolicyManager update settings'
-    }
-
-    # --- orchestrator tasks
-    $script:BadTasks = @()
-    if (Get-Command Get-ScheduledTask -ErrorAction SilentlyContinue) {
-        try {
-            $tasks = @(Get-ScheduledTask -TaskPath '\Microsoft\Windows\UpdateOrchestrator\*' -ErrorAction Stop)
-            $script:BadTasks = @($tasks | Where-Object { $_.State -eq 'Disabled' })
-            if ($script:BadTasks.Count -gt 0) { Write-Step 'orchestrator tasks' 'warn' "$($script:BadTasks.Count) of $($tasks.Count) disabled" }
-            else { Write-Step 'orchestrator tasks' 'ok' "$($tasks.Count) present, none disabled" }
-        } catch { Write-Step 'orchestrator tasks' 'skip' 'unreadable' }
-    }
-
-    # --- recent client errors, decoded
-    $script:WuErrors = @()
-    try {
-        $ev = Get-WinEvent -FilterHashtable @{ LogName='Microsoft-Windows-WindowsUpdateClient/Operational'; Level=2 } -MaxEvents 15 -ErrorAction Stop
-        foreach ($e in $ev) {
-            $code = ''
-            $m = [regex]::Match($e.Message, '0x[0-9A-Fa-f]{8}')
-            if ($m.Success) { $code = $m.Value }
-            $script:WuErrors += [pscustomobject]@{ Time = $e.TimeCreated; Id = $e.Id; Code = $code }
-        }
-    } catch { }
-    if ($script:WuErrors.Count -gt 0) {
-        $codes = @($script:WuErrors | Where-Object { $_.Code } | Select-Object -ExpandProperty Code -Unique)
-        Write-Step 'recent WU errors' 'warn' ("{0} in log; codes: {1}" -f $script:WuErrors.Count, (($codes | Select-Object -First 4) -join ' '))
-        $known = @{
-            '0x80070020' = 'file in use - another process (often AV) holds a staged file'
-            '0x80073712' = 'component store corruption - DISM RestoreHealth is the fix'
-            '0x800f0922' = 'reserved partition too small, or cannot reach update endpoint'
-            '0x80240034' = 'download failed - BITS or the source endpoint'
-            '0x8024402c' = 'cannot reach the configured update source (WSUS/proxy)'
-            '0x80244022' = 'update source returned HTTP 503'
-            '0x80070005' = 'access denied - permissions or endpoint protection blocked it'
-            '0x800705b4' = 'operation timed out'
-            '0x80248007' = 'datastore missing or corrupt - the cache rename is the fix'
-        }
-        $lines = @()
-        foreach ($c in $codes) { if ($known.ContainsKey($c.ToLower()) -or $known.ContainsKey($c)) {
-            $k = if ($known.ContainsKey($c)) { $c } else { $c.ToLower() }
-            $lines += "  $c  $($known[$k])" } else { $lines += "  $c  (not in local table)" } }
-        if ($lines.Count -gt 0) { Add-Advisory 'What the update client actually logged' (($lines | Select-Object -Unique) -join "`n") }
-    } else {
-        Write-Step 'recent WU errors' 'ok' 'none in the operational log'
-    }
-
-    # --- image health (read-only)
-    $script:ImageSick = $false
-    $chk = Invoke-Guarded -FilePath 'DISM.exe' -Arguments '/Online /Cleanup-Image /CheckHealth' -Label 'component store check' -Quiet
-    if (-not $chk.Skipped) {
-        if ($chk.Output -match 'repairable') { $script:ImageSick = $true; Write-Step 'component store' 'warn' 'repairable corruption detected' }
-        elseif ($chk.Output -match 'No component store corruption') { Write-Step 'component store' 'ok' 'no corruption detected' }
-        else { Write-Step 'component store' 'warn' "DISM exit $($chk.ExitCode) - inconclusive" }
-    }
-
-    # --- packages stuck mid-install
-    $script:StuckPkgs = @()
-    $pkg = Invoke-Guarded -FilePath 'DISM.exe' -Arguments '/Online /Get-Packages /Format:Table' -Label 'package state sweep' -Quiet
-    if (-not $pkg.Skipped -and $pkg.Output) {
-        foreach ($l in ($pkg.Output -split "`n")) {
-            if ($l -match 'Install Pending|Uninstall Pending|Superseded Pending') {
-                $script:StuckPkgs += $l.Trim()
-            }
-        }
-    }
-    if ($script:StuckPkgs.Count -gt 0) {
-        Write-Step 'stuck packages' 'warn' "$($script:StuckPkgs.Count) in a pending state"
-        Add-Advisory 'Packages are parked in a pending state' @"
-$(($script:StuckPkgs | Select-Object -First 8) -join "`n")
-
-A package in Install Pending is waiting on a restart to finish its transaction.
-That is a reboot, not a reset. If these are still pending after a clean restart,
-the component store is the problem and RestoreHealth is the next move - which is
-what the RECONSTITUTE tier does.
-"@
-    } else {
-        Write-Step 'stuck packages' 'ok' 'none pending'
-    }
-
-    return $true
-}
-
-#--- TIER 2: QUENCH ------------------------------------------------------------
-function Invoke-Quench {
-    $script:CurrentTier = 'QUENCH'
-    Write-Tier 'QUENCH' 'halt the update stack before dissolving anything'
-    foreach ($n in @('UsoSvc','DoSvc','wuauserv','bits','cryptsvc','msiserver')) {
-        $nice = ($script:SvcList | Where-Object { $_.Name -eq $n }).Nice
-        if (-not $nice) { $nice = $n }
-        Stop-UpdateService -ServiceName $n -Nice $nice
-    }
-}
-
-#--- TIER 3: DISSOLVE ----------------------------------------------------------
-function Invoke-Dissolve {
-    $script:CurrentTier = 'DISSOLVE'
-    Write-Tier 'DISSOLVE' 'rename the poisoned caches - nothing is deleted'
-
-    # BITS queue, via the in-box cmdlets. Deliberately not bitsadmin.exe.
-    if (Get-Command Remove-BitsTransfer -ErrorAction SilentlyContinue) {
-        try {
-            $jobs = @(Get-BitsTransfer -AllUsers -ErrorAction Stop)
-            if ($jobs.Count -eq 0) { Write-Step 'BITS queue' 'ok' 'already empty' }
-            elseif ($script:Cfg.DryRun) { Write-Step 'BITS queue' 'dry' "would cancel $($jobs.Count) jobs" }
-            else {
-                $jobs | Remove-BitsTransfer -ErrorAction SilentlyContinue
-                Write-Step 'BITS queue' 'fixed' "cancelled $($jobs.Count) jobs"
-            }
-        } catch { Write-Step 'BITS queue' 'blocked' 'could not enumerate transfers' }
-    } else { Write-Step 'BITS queue' 'skip' 'cmdlets unavailable' }
-
-    # SoftwareDistribution: whole folder first, then the two children that matter.
-    $script:SdRenamed = Rename-Stale -Path $script:SdPath -Nice 'SoftwareDistribution'
-    if (-not $script:SdRenamed -and (Test-Path -LiteralPath $script:SdPath)) {
-        foreach ($child in @('Download','DataStore')) {
-            $p = Join-Path $script:SdPath $child
-            $null = Rename-Stale -Path $p -Nice "  fallback: $child"
-        }
-        if ($script:Cfg.ScheduleLocked -and -not $script:Cfg.DryRun) {
-            try {
-                $key = 'HKLM:\SYSTEM\CurrentControlSet\Control\Session Manager'
-                $cur = @(Get-RegValue $key 'PendingFileRenameOperations')
-                $src = '\??\' + $script:SdPath
-                $dst = '!\??\' + $script:SdPath + '.old.' + $script:Stamp
-                Set-ItemProperty -Path $key -Name 'PendingFileRenameOperations' -Value ($cur + @($src, $dst)) -Type MultiString -ErrorAction Stop
-                Write-Step 'queued for next boot' 'fixed' 'rename scheduled via PendingFileRenameOperations'
-                Add-Advisory 'A rename was queued for the next restart' 'SoftwareDistribution is locked right now and the rename was scheduled to run during the next boot, before the lock exists. The machine must actually be restarted for it to happen.'
-            } catch {
-                Write-Step 'queued for next boot' 'fail' 'could not write the pending-rename key'
-            }
-        }
-    }
-
-    # catroot2 needs cryptsvc down; it is rebuilt automatically on next scan.
-    $null = Rename-Stale -Path $script:CatPath -Nice 'catroot2'
-
-    # Delivery Optimization cache - in-box cmdlet, no shelling.
-    if (Get-Command Delete-DeliveryOptimizationCache -ErrorAction SilentlyContinue) {
-        if ($script:Cfg.DryRun) { Write-Step 'Delivery Optimization cache' 'dry' 'would purge' }
-        else {
-            try {
-                Delete-DeliveryOptimizationCache -Force -ErrorAction Stop
-                Write-Step 'Delivery Optimization cache' 'fixed' 'purged'
-            } catch { Write-Step 'Delivery Optimization cache' 'blocked' 'refused (service state or policy)' }
-        }
-    } else { Write-Step 'Delivery Optimization cache' 'skip' 'cmdlet not on this build' }
-
-    # The deliberate omissions, stated out loud rather than silently skipped.
-    Write-Step 'regsvr32 DLL re-registration' 'skip' 'not attempted by design - Panda blocks it'
-    Write-Step 'bitsadmin / wusa / sc.exe' 'skip' 'not attempted by design - EDR-flagged LOLBins'
-}
-
-#--- TIER 4: RECONSTITUTE ------------------------------------------------------
-function Invoke-Reconstitute {
-    $script:CurrentTier = 'RECONSTITUTE'
-    Write-Tier 'RECONSTITUTE' 'put the machinery back the way Windows expects it'
-
-    foreach ($svc in $script:SvcList) {
-        $st = $script:SvcState[$svc.Name]
-        if (-not $st) { continue }
-        if ($st.StartMode -eq 'Disabled' -or ($st.StartMode -eq 'Auto' -and $svc.Want -eq 'Manual')) {
-            if ($script:Cfg.DryRun) { Write-Step "$($svc.Nice) start type" 'dry' "would set $($svc.Want)"; continue }
-            try {
-                Set-Service -Name $svc.Name -StartupType $svc.Want -ErrorAction Stop
-                Write-Step "$($svc.Nice) start type" 'fixed' "$($st.StartMode) -> $($svc.Want)"
-            } catch {
-                Write-Step "$($svc.Nice) start type" 'blocked' "could not set $($svc.Want)"
-            }
-        } else {
-            Write-Step "$($svc.Nice) start type" 'ok' $st.StartMode
-        }
-    }
-
-    if ($script:BadTasks -and $script:BadTasks.Count -gt 0) {
-        foreach ($t in $script:BadTasks) {
-            if ($script:Cfg.DryRun) { Write-Step "task $($t.TaskName)" 'dry' 'would enable'; continue }
-            try {
-                Enable-ScheduledTask -TaskName $t.TaskName -TaskPath $t.TaskPath -ErrorAction Stop | Out-Null
-                Write-Step "task $($t.TaskName)" 'fixed' 'enabled'
-            } catch {
-                Write-Step "task $($t.TaskName)" 'blocked' 'refused - usually held by policy or Update Medic'
-            }
-        }
-    }
-
-    if ($script:Cfg.ClearPolicyKeys -and $script:Policy.Count -gt 0) {
-        $polPath = 'HKLM:\SOFTWARE\Policies\Microsoft\Windows\WindowsUpdate'
-        $backup  = Join-Path $script:Root ("wu_policy_{0}_{1}.reg" -f $env:COMPUTERNAME, $script:Stamp)
-        if ($script:Cfg.DryRun) { Write-Step 'WU policy keys' 'dry' "would back up to $backup then remove" }
-        else {
-            $exp = Invoke-Guarded -FilePath 'reg.exe' -Arguments ("export `"HKLM\SOFTWARE\Policies\Microsoft\Windows\WindowsUpdate`" `"$backup`" /y") -Label 'export policy backup' -Quiet
-            if ($exp.ExitCode -eq 0) {
-                try {
-                    Remove-Item -Path $polPath -Recurse -Force -ErrorAction Stop
-                    Write-Step 'WU policy keys' 'fixed' "removed - backup at $backup"
-                    Add-Advisory 'Update policy was removed' @"
-A .reg backup is at $backup. Do not assume this reapplies on its own.
-
-  Active Directory GPO  - yes. Rewrites this key on its own cycle (90 min by
-                          default) or immediately on gpupdate /force.
-  Intune Update rings   - not from here. Rings write to PolicyManager, a
-                          different key this option never touched.
-  Intune ADMX / Admin
-  Templates profiles    - these DO land in this key, and Microsoft does not
-                          document MDM re-pushing a value deleted locally while
-                          the policy itself is unchanged. A plain device sync may
-                          not bring it back. Editing and re-saving the profile, or
-                          re-assigning it, forces a change-based push that will.
-
-Device check-in is roughly every 8 hours, and no more than one maintenance sync
-per 6.5 hours. Settings > Accounts > Access work or school > Info > Sync, or the
-Sync action in the Intune admin center, is the fast path.
-"@
-                } catch { Write-Step 'WU policy keys' 'fail' 'export succeeded but removal was refused' }
-            } else { Write-Step 'WU policy keys' 'fail' 'backup export failed - nothing was removed' }
-        }
-    }
-
-    if ($script:Cfg.ServicingRepair -and ($script:ImageSick -or $script:StuckPkgs.Count -gt 0 -or $script:WuErrors.Count -gt 0)) {
-        $r = Invoke-Guarded -FilePath 'DISM.exe' -Arguments '/Online /Cleanup-Image /RestoreHealth' -Label 'DISM RestoreHealth'
-        if (-not $r.Skipped) {
-            if ($r.ExitCode -eq 0) { Write-Step 'DISM RestoreHealth' 'fixed' 'completed' }
-            else {
-                Write-Step 'DISM RestoreHealth' 'fail' "exit $($r.ExitCode)"
-                Add-Advisory 'RestoreHealth could not repair the image' 'With no WSUS source and no reachable Windows Update, DISM has nowhere to pull replacement payloads from. A matching install.wim or an ISO of the same build, passed with /Source, is the offline path.'
-            }
-            $s = Invoke-Guarded -FilePath 'sfc.exe' -Arguments '/scannow' -Label 'SFC scan'
-            if (-not $s.Skipped) {
-                if     ($s.Output -match 'did not find any integrity violations') { Write-Step 'SFC' 'ok' 'no integrity violations' }
-                elseif ($s.Output -match 'successfully repaired')                 { Write-Step 'SFC' 'fixed' 'repaired protected files' }
-                elseif ($s.Output -match 'unable to fix')                          { Write-Step 'SFC' 'fail' 'found damage it could not repair' }
-                else { Write-Step 'SFC' 'warn' "exit $($s.ExitCode) - verdict unclear, check CBS.log" }
-            }
-        }
-    } else {
-        Write-Step 'servicing repair' 'skip' 'image looked clean, or turned off in setup'
-    }
-
-    if ($script:Cfg.ComponentCleanup) {
-        $c = Invoke-Guarded -FilePath 'DISM.exe' -Arguments '/Online /Cleanup-Image /StartComponentCleanup' -Label 'component cleanup'
-        if (-not $c.Skipped) {
-            if ($c.ExitCode -eq 0) { Write-Step 'component cleanup' 'fixed' 'superseded payloads reclaimed' }
-            else { Write-Step 'component cleanup' 'warn' "exit $($c.ExitCode)" }
-        }
-    }
-}
-
-#--- TIER 5: PROGNOSIS ---------------------------------------------------------
-function Invoke-Prognosis {
-    $script:CurrentTier = 'PROGNOSIS'
-    Write-Tier 'PROGNOSIS' 'restart the stack, ask for a scan, tell the truth about it'
-
-    foreach ($n in @('cryptsvc','bits','wuauserv','UsoSvc','DoSvc')) {
-        if (-not $script:SvcState.ContainsKey($n)) { continue }
-        if ($script:Cfg.DryRun) { Write-Step "start $n" 'dry' 'would start'; continue }
-        try {
-            Start-Service -Name $n -ErrorAction Stop
-            Write-Step "start $n" 'fixed' 'running'
-        } catch {
-            $s = (Get-Service -Name $n -ErrorAction SilentlyContinue)
-            if ($s -and $s.StartType -eq 'Manual') { Write-Step "start $n" 'ok' 'trigger-start, will run on demand' }
-            else { Write-Step "start $n" 'warn' 'did not start' }
-        }
-    }
-
-    # Ask for a detection pass. Report that it was ASKED FOR, never that the
-    # machine is up to date - under SYSTEM the COM search can no-op silently and
-    # a "current" verdict here would be a lie.
-    $script:ScanAsked = $false
-    if (-not $script:Cfg.DryRun) {
-        try {
-            $au = New-Object -ComObject Microsoft.Update.AutoUpdate
-            $au.DetectNow()
-            $script:ScanAsked = $true
-            Write-Step 'detection pass' 'fixed' 'requested via Microsoft.Update.AutoUpdate'
-        } catch {
-            $uso = Join-Path $env:windir 'System32\UsoClient.exe'
-            if (Test-Path -LiteralPath $uso) {
-                $u = Invoke-Guarded -FilePath $uso -Arguments 'StartScan' -Label 'orchestrator scan' -Quiet -TimeoutSec 120
-                if ($u.ExitCode -eq 0) { $script:ScanAsked = $true; Write-Step 'detection pass' 'fixed' 'requested via UsoClient' }
-                else { Write-Step 'detection pass' 'warn' 'scan request returned an error' }
-            } else { Write-Step 'detection pass' 'warn' 'no way to request a scan on this build' }
-        }
-        if ($script:ScanAsked) {
-            Add-Advisory 'A scan was requested, not verified' 'The detection pass was handed to Windows. Whether it completes cannot be confirmed from here, especially under SYSTEM. Open Settings > Windows Update on the frontstage session and watch it move before calling this fixed.'
-        }
-    }
-
-    # re-read the pending state
-    $after = @()
-    if (Test-Path 'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Component Based Servicing\RebootPending') { $after += 'CBS RebootPending' }
-    if (Test-Path 'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\WindowsUpdate\Auto Update\RebootRequired') { $after += 'WU RebootRequired' }
-    if (Get-RegValue 'HKLM:\SYSTEM\CurrentControlSet\Control\Session Manager' 'PendingFileRenameOperations') { $after += 'PendingFileRenameOperations' }
-    $script:PendingAfter = $after
-
-    # ---- verdict
-    $fails   = @($script:Ledger | Where-Object { $_.Status -eq 'fail' })
-    $blocked = @($script:Ledger | Where-Object { $_.Status -eq 'blocked' })
-    $fixed   = @($script:Ledger | Where-Object { $_.Status -eq 'fixed' })
-
-    if ($fails.Count -gt 0)        { $verdict = 'ATTENTION - something here needs a human';  $vc = @(201,72,75);  $global:AlkahestExit = 2 }
-    elseif ($blocked.Count -gt 0)  { $verdict = 'PARTIAL - steps were blocked on this box';  $vc = @(208,138,58); $global:AlkahestExit = 1 }
-    elseif ($fixed.Count -gt 0)    { $verdict = 'DISSOLVED - the update stack was reset';    $vc = @(74,166,184); $global:AlkahestExit = 0 }
-    else                           { $verdict = 'CLEAR - nothing was blocking updates';      $vc = @(95,179,122); $global:AlkahestExit = 0 }
-    if ($script:Cfg.DryRun)        { $verdict = 'DRY RUN - nothing on this machine changed'; $vc = @(107,107,120); $global:AlkahestExit = 0 }
-
-    Show-Label -Verdict $verdict -VerdictColor $vc
-
-    Write-Host ''
-    Write-Host ('   ' + (Bone 'SIG - what was done'))
-    foreach ($e in ($script:Ledger | Where-Object { $_.Status -in @('fixed','fail','blocked') })) {
-        $c = switch ($e.Status) { 'fixed' { 'Vitri' } 'fail' { 'Blood' } default { 'Amber' } }
-        Write-Host ('     ' + (& $c ("{0,-9}" -f $e.Status)) + (Bone $e.Step) + (Dim ("  -  " + $e.Detail)))
-    }
-    if (-not ($script:Ledger | Where-Object { $_.Status -in @('fixed','fail','blocked') })) {
-        Write-Host ('     ' + (Dim 'nothing needed changing'))
-    }
-
-    if ($script:Advisories.Count -gt 0) {
-        Write-Host ''
-        Write-Host ('   ' + (Amber 'ADVISORIES'))
-        foreach ($a in $script:Advisories) {
-            Write-Host ('     ' + (Amber ('* ' + $a.Title)))
-            foreach ($l in ($a.Body -split "`n")) { Write-Host ('       ' + (Dim $l.TrimEnd())) }
-            Write-Host ''
-        }
-    }
-
-    if ($script:PendingAfter.Count -gt 0 -or $script:StuckPkgs.Count -gt 0) {
-        Write-Host ''
-        Write-Host (Amber '   +------------------------------------------------------------------+')
-        Write-Host (Amber '   |  RESTART REQUIRED TO FINISH                                      |')
-        Write-Host (Amber '   |  A servicing transaction is staged and completes only on boot.   |')
-        Write-Host (Amber '   |  Nothing here forces it. Schedule it with the client.            |')
-        Write-Host (Amber '   +------------------------------------------------------------------+')
-    }
-
-    # ---- RMM ingest contract
-    $summary = [ordered]@{
-        tool          = $script:Name
-        version       = $script:Version
-        host          = $env:COMPUTERNAME
-        started       = $script:Started.ToString('o')
-        finished      = (Get-Date).ToString('o')
-        verdict       = $verdict
-        exit          = $global:AlkahestExit
-        dryRun        = [bool]$script:Cfg.DryRun
-        pandaPresent  = [bool]$script:Panda
-        freeGB        = $script:FreeGB
-        uptimeDays    = $script:UptimeDays
-        pendingBefore = @($script:Pending)
-        pendingAfter  = @($script:PendingAfter)
-        stuckPackages = @($script:StuckPkgs).Count
-        policyKeys    = @($script:Policy.Keys)
-        scanRequested = [bool]$script:ScanAsked
-        rebootNeeded  = [bool](($script:PendingAfter.Count -gt 0) -or ($script:StuckPkgs.Count -gt 0))
-        steps         = @($script:Ledger)
-        advisories    = @($script:Advisories | Select-Object -ExpandProperty Title)
-    }
-    try {
-        $jsonPath = Join-Path $script:Root ("alkahest_{0}_{1}.json" -f $env:COMPUTERNAME, $script:Stamp)
-        ($summary | ConvertTo-Json -Depth 5) | Set-Content -LiteralPath $jsonPath -Encoding UTF8
-        Write-Host ''
-        Write-Host ('   ' + (Dim "summary: $jsonPath"))
-    } catch { }
-}
-
-#--- ARRIVAL -------------------------------------------------------------------
-try { $null = New-Item -ItemType Directory -Path $script:Root -Force -ErrorAction Stop } catch { }
-try { Start-Transcript -Path $script:LogFile -Force | Out-Null } catch { }
-
-$script:OsCaption = 'unknown'
-$script:OsBuild   = '0'
-$script:CurrentTier = 'SETUP'
-
-Write-Host ''
-Write-Host ('   ' + (Iris 'ALKAHEST') + (Dim '  -  the universal solvent  -  for update stacks that will not move'))
-Write-Host ('   ' + (Dim 'nothing is deleted . nothing reboots . caches are renamed, never removed'))
-
+Show-Banner
 Show-Setup
+if ($script:AlkahestAbort) { $global:AlkahestExit = 0; return }
 
-if (Invoke-Diagnose) {
-    Invoke-Quench
-    Invoke-Dissolve
-    Invoke-Reconstitute
-    Invoke-Prognosis
-} else {
-    $global:AlkahestExit = 2
-    Show-Label -Verdict 'HALTED - run this from an elevated prompt' -VerdictColor @(201,72,75)
+$script:LogFile = $null
+try {
+    if (-not (Test-Path $Alkahest.LogRoot)) { New-Item -ItemType Directory -Path $Alkahest.LogRoot -Force | Out-Null }
+    $script:LogFile = Join-Path $Alkahest.LogRoot ("alkahest_{0}_{1}.log" -f $env:COMPUTERNAME, (Get-Date -Format 'yyyyMMdd_HHmmss'))
+    Start-Transcript -Path $script:LogFile -Append -ErrorAction SilentlyContinue | Out-Null
+} catch { $script:LogFile = $null }
+
+Rule 'DIAGNOSE'
+
+# 1 — elevation / context
+try {
+    $isAdmin = ([Security.Principal.WindowsPrincipal][Security.Principal.WindowsIdentity]::GetCurrent()
+    ).IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)
+} catch { $isAdmin = $false }
+$isSystem = $script:Ledger.Context -eq 'NT AUTHORITY\SYSTEM'
+if ($isSystem)    { Status $G.Ok 'elevation' 'SYSTEM' $Clr.Green }
+elseif ($isAdmin) { Status $G.Ok 'elevation' 'Administrator' $Clr.Green }
+else {
+    Status $G.Fail 'elevation' 'NOT elevated — cannot proceed' $Clr.Red
+    $script:Ledger.Proceed = $false
+    $script:Ledger.Symptoms.Add('not run as admin/SYSTEM')
 }
 
-try { Stop-Transcript | Out-Null } catch { }
+# 2 — uptime. a staged transaction often just needs the restart.
+if ($script:Ledger.UptimeDays -gt 14) {
+    Status $G.Warn 'uptime' "$($script:Ledger.UptimeText) — a staged servicing op may only need the reboot" $Clr.Orange
+} elseif ($script:Ledger.UptimeText) {
+    Status $G.Ok 'uptime' $script:Ledger.UptimeText $Clr.Green
+}
+
+# 3 — disk headroom
+try {
+    $vol = Get-CimInstance Win32_LogicalDisk -Filter "DeviceID='$($env:SystemDrive)'" -ErrorAction Stop
+    $script:Ledger.FreeGB = [Math]::Round($vol.FreeSpace/1GB,1)
+    if ($script:Ledger.FreeGB -ge 20) {
+        Status $G.Ok 'disk headroom' "$($script:Ledger.FreeGB) GB free" $Clr.Green
+    } elseif ($script:Ledger.FreeGB -ge $Alkahest.MinFreeGB) {
+        Status $G.Warn 'disk headroom' "$($script:Ledger.FreeGB) GB — tight for a feature update" $Clr.Orange
+    } else {
+        Status $G.Fail 'disk headroom' "$($script:Ledger.FreeGB) GB — below the $($Alkahest.MinFreeGB)GB floor" $Clr.Red
+        $script:Ledger.Symptoms.Add("low disk: $($script:Ledger.FreeGB) GB free")
+        $script:Ledger.Warnings.Add('low disk — updates will keep failing until space is reclaimed; that is Panacea PURGE work')
+    }
+} catch { Status $G.Skip 'disk headroom' 'unreadable' $Clr.Grey }
+
+# 4 — endpoint protection. name it, because it changes what will work.
+$pandaHits = @()
+foreach ($sn in @('PandaAetherAgent','PSUAService','NanoServiceMain','PandaSecurityService','PandaAgent')) {
+    try { if (Get-Service -Name $sn -ErrorAction Stop) { $pandaHits += $sn } } catch {}
+}
+if (Test-Path 'HKLM:\SOFTWARE\Panda Security') { $pandaHits += 'registry' }
+if (Test-Path 'HKLM:\SOFTWARE\WOW6432Node\Panda Security') { $pandaHits += 'registry(x86)' }
+if ($pandaHits.Count -gt 0) {
+    $script:Ledger.PandaPresent = $true
+    Status $G.Warn 'endpoint protection' ("Panda present — " + ($pandaHits -join ', ')) $Clr.Orange
+    Note @(
+        'the usual "reset windows update" recipe re-registers a dozen DLLs with',
+        'regsvr32 and drives BITS with bitsadmin. Panda blocks or quarantines both,',
+        'so ALKAHEST uses neither. if a hand-run of that recipe is how this box got',
+        'here, the aborted half of it is likely part of the blockage.'
+    )
+} else {
+    Status $G.Ok 'endpoint protection' 'no Panda signature found' $Clr.Green
+}
+
+# 5 — service posture
+foreach ($svc in $script:SvcSpec) {
+    try {
+        $s = Get-Service -Name $svc.Name -ErrorAction Stop
+        $wmi = Get-CimInstance Win32_Service -Filter "Name='$($svc.Name)'" -ErrorAction SilentlyContinue
+        $start = if ($wmi) { $wmi.StartMode } else { 'unknown' }
+        $script:SvcState[$svc.Name] = [pscustomobject]@{ Status = $s.Status; StartMode = $start }
+        if ($start -eq 'Disabled') {
+            Status $G.Fail $svc.Nice "DISABLED ($($s.Status)) — this alone stops updates" $Clr.Red
+            $script:Ledger.Symptoms.Add("$($svc.Name) disabled")
+        } else {
+            Status $G.Ok $svc.Nice "$($s.Status) / $start" $Clr.Green
+        }
+    } catch { Status $G.Skip $svc.Nice 'not present on this build' $Clr.Grey }
+}
+try {
+    $medic = Get-Service -Name 'WaaSMedicSvc' -ErrorAction Stop
+    Status $G.Warn 'update medic' "$($medic.Status) — reverts manual WU changes by design" $Clr.Orange
+} catch {}
+
+# 6 — pending servicing. read-only. never cleared by hand.
+$pendKeys = @(
+    @{ P='HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Component Based Servicing\RebootPending'; N='CBS RebootPending' },
+    @{ P='HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Component Based Servicing\PackagesPending'; N='CBS PackagesPending' },
+    @{ P='HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\WindowsUpdate\Auto Update\RebootRequired'; N='WU RebootRequired' }
+)
+foreach ($k in $pendKeys) { if (Test-Path $k.P) { $script:Ledger.PendingBefore.Add($k.N) } }
+if (Get-RegValue 'HKLM:\SYSTEM\CurrentControlSet\Control\Session Manager' 'PendingFileRenameOperations') {
+    $script:Ledger.PendingBefore.Add('PendingFileRenameOperations')
+}
+foreach ($x in @('pending.xml','reboot.xml','SessionsPending.xml')) {
+    if (Test-Path -LiteralPath (Join-Path $env:windir "WinSxS\$x")) { $script:Ledger.PendingBefore.Add("WinSxS\$x") }
+}
+if ($script:Ledger.PendingBefore.Count -gt 0) {
+    Status $G.Warn 'pending servicing' (($script:Ledger.PendingBefore) -join ', ') $Clr.Orange
+    Note @(
+        'read-only finding — ALKAHEST does not touch these. a staged CBS transaction',
+        'completes on the next restart; clearing it by hand is how a machine ends up',
+        'with a half-installed component store.'
+    )
+} else {
+    Status $G.Ok 'pending servicing' 'nothing staged' $Clr.Green
+}
+
+# 7 — cache footprint
+$script:SdPath  = Join-Path $env:windir 'SoftwareDistribution'
+$script:CatPath = Join-Path $env:windir 'System32\catroot2'
+$sdGB = Get-DirSizeGB $script:SdPath
+$oldest = $null
+try {
+    $f = Get-ChildItem -LiteralPath (Join-Path $script:SdPath 'Download') -Recurse -Force -File -ErrorAction SilentlyContinue |
+         Sort-Object LastWriteTime | Select-Object -First 1
+    if ($f) { $oldest = [Math]::Round(((Get-Date) - $f.LastWriteTime).TotalDays,1) }
+} catch {}
+$sdNote = "$sdGB GB"
+if ($null -ne $oldest) { $sdNote += " · oldest staged payload $oldest days old" }
+if ($null -ne $oldest -and $oldest -gt 7) { Status $G.Warn 'softwaredistribution' $sdNote $Clr.Orange }
+else { Status $G.Ok 'softwaredistribution' $sdNote $Clr.Green }
+
+# 8 — BITS queue
+$script:BitsCount = 0
+if (Get-Command Get-BitsTransfer -ErrorAction SilentlyContinue) {
+    try {
+        $jobs = @(Get-BitsTransfer -AllUsers -ErrorAction Stop)
+        $script:BitsCount = $jobs.Count
+        $stuck = @($jobs | Where-Object { $_.JobState -in @('Error','TransientError','Suspended') })
+        if ($stuck.Count -gt 0)    { Status $G.Warn 'BITS queue' "$($jobs.Count) jobs · $($stuck.Count) errored" $Clr.Orange }
+        elseif ($jobs.Count -gt 0) { Status $G.Ok 'BITS queue' "$($jobs.Count) jobs · none errored" $Clr.Green }
+        else                       { Status $G.Ok 'BITS queue' 'empty' $Clr.Green }
+    } catch { Status $G.Skip 'BITS queue' 'unreadable (BITS may be stopped)' $Clr.Grey }
+} else { Status $G.Skip 'BITS queue' 'cmdlets unavailable' $Clr.Grey }
+
+# 9 — update policy. report, never assume it is wrong.
+$polPath = 'HKLM:\SOFTWARE\Policies\Microsoft\Windows\WindowsUpdate'
+$script:Policy = @{}
+if (Test-Path $polPath) {
+    foreach ($n in @('WUServer','WUStatusServer','TargetGroup','DoNotConnectToWindowsUpdateInternetLocations','DisableWindowsUpdateAccess','SetPolicyDrivenUpdateSourceForFeatureUpdates')) {
+        $v = Get-RegValue $polPath $n
+        if ($null -ne $v) { $script:Policy[$n] = $v }
+    }
+    $au = Get-RegValue "$polPath\AU" 'UseWUServer'
+    if ($null -ne $au) { $script:Policy['UseWUServer'] = $au }
+}
+if ($script:Policy.Count -gt 0) {
+    Status $G.Warn 'group policy (WU)' (($script:Policy.Keys | Sort-Object) -join ', ') $Clr.Orange
+    $wsus = $script:Policy['WUServer']
+    if ($wsus) {
+        $reach = 'not tested'
+        try {
+            $u = [uri]$wsus
+            $port = if ($u.Port -gt 0) { $u.Port } else { if ($u.Scheme -eq 'https') { 443 } else { 80 } }
+            $t = Test-NetConnection -ComputerName $u.Host -Port $port -InformationLevel Quiet -WarningAction SilentlyContinue
+            $reach = if ($t) { 'reachable' } else { 'UNREACHABLE' }
+        } catch { $reach = 'could not test' }
+        if ($reach -eq 'UNREACHABLE') {
+            Status $G.Fail 'WSUS endpoint' "$wsus — UNREACHABLE" $Clr.Red
+            Note @(
+                'pointed at a WSUS server it cannot reach. that is exactly the symptom',
+                'being chased, and no amount of cache clearing fixes it. confirm with',
+                'whoever owns this tenant patching before changing anything.'
+            )
+            $script:Ledger.Symptoms.Add('WSUS unreachable')
+            $script:Ledger.Warnings.Add("WSUS UNREACHABLE — $wsus; the fix is on the server or the network path, not this endpoint")
+        } else {
+            Status $G.Ok 'WSUS endpoint' "$wsus — $reach" $Clr.Green
+        }
+    }
+} else {
+    Status $G.Ok 'group policy (WU)' 'no WSUS/GPO update keys set' $Clr.Green
+}
+
+# 10 — MDM policy. Intune rings do NOT live in the key above; without this read,
+#      a ring-managed box reports "no policy" and lies to the tech.
+$mdmPath = 'HKLM:\SOFTWARE\Microsoft\PolicyManager\default\Update'
+$script:MdmPolicy = @()
+if (Test-Path $mdmPath) {
+    try { $script:MdmPolicy = @(Get-ChildItem -Path $mdmPath -ErrorAction Stop | Select-Object -ExpandProperty PSChildName) } catch {}
+}
+if ($script:MdmPolicy.Count -gt 0) {
+    Status $G.Warn 'MDM policy (Intune)' "$($script:MdmPolicy.Count) settings under PolicyManager" $Clr.Orange
+    Note @(
+        (($script:MdmPolicy | Sort-Object | Select-Object -First 10) -join ', '),
+        'read from PolicyManager\default\Update. neither ALKAHEST nor the clear-policy',
+        'option touches this key. deferrals, pauses and a pinned target release set here',
+        'hold updates back and look exactly like a stuck stack — check the assigned ring.'
+    )
+} else {
+    Status $G.Ok 'MDM policy (Intune)' 'no PolicyManager update settings' $Clr.Green
+}
+
+# 11 — orchestrator tasks
+$script:BadTasks = @()
+if (Get-Command Get-ScheduledTask -ErrorAction SilentlyContinue) {
+    try {
+        $tasks = @(Get-ScheduledTask -TaskPath '\Microsoft\Windows\UpdateOrchestrator\*' -ErrorAction Stop)
+        $script:BadTasks = @($tasks | Where-Object { $_.State -eq 'Disabled' })
+        if ($script:BadTasks.Count -gt 0) { Status $G.Warn 'orchestrator tasks' "$($script:BadTasks.Count) of $($tasks.Count) disabled" $Clr.Orange }
+        else { Status $G.Ok 'orchestrator tasks' "$($tasks.Count) present · none disabled" $Clr.Green }
+    } catch { Status $G.Skip 'orchestrator tasks' 'unreadable' $Clr.Grey }
+}
+
+# 12 — what the client actually logged
+$script:WuErrCount = 0
+$knownCodes = @{
+    '0x80070020' = 'file in use — another process (often AV) holds a staged file'
+    '0x80073712' = 'component store corruption — RestoreHealth is the fix'
+    '0x800f0922' = 'reserved partition too small, or cannot reach the update endpoint'
+    '0x80240034' = 'download failed — BITS or the source endpoint'
+    '0x8024402c' = 'cannot reach the configured update source (WSUS/proxy)'
+    '0x80244022' = 'update source returned HTTP 503'
+    '0x80070005' = 'access denied — permissions or endpoint protection blocked it'
+    '0x800705b4' = 'operation timed out'
+    '0x80248007' = 'datastore missing or corrupt — the cache rename is the fix'
+}
+try {
+    $ev = Get-WinEvent -FilterHashtable @{ LogName='Microsoft-Windows-WindowsUpdateClient/Operational'; Level=2 } -MaxEvents 15 -ErrorAction Stop
+    $script:WuErrCount = @($ev).Count
+    $codes = @()
+    foreach ($x in $ev) {
+        $m = [regex]::Match($x.Message,'0x[0-9A-Fa-f]{8}')
+        if ($m.Success) { $codes += $m.Value.ToLower() }
+    }
+    $codes = @($codes | Select-Object -Unique)
+    if ($script:WuErrCount -gt 0) {
+        Status $G.Warn 'recent WU errors' "$($script:WuErrCount) in the operational log" $Clr.Orange
+        $lines = @()
+        foreach ($c in $codes) {
+            if ($knownCodes.ContainsKey($c)) { $lines += "$c  $($knownCodes[$c])" } else { $lines += "$c  (not in the local table)" }
+        }
+        if ($lines.Count -gt 0) { Note $lines }
+    } else {
+        Status $G.Ok 'recent WU errors' 'none in the operational log' $Clr.Green
+    }
+} catch { Status $G.Skip 'recent WU errors' 'log unreadable' $Clr.Grey }
+
+# 13 — component store health (read-only)
+$script:ImageSick = $false
+$chk = Invoke-Guarded -File 'DISM.exe' -Arguments '/Online /Cleanup-Image /CheckHealth' -Label 'checking component store' -TimeoutSec $Alkahest.DismCheckTimeoutSec
+if ($chk.Skipped)      { Status $G.Skip 'component store' 'skipped by operator' $Clr.Grey }
+elseif ($chk.TimedOut) { Status $G.Warn 'component store' 'timed out' $Clr.Orange }
+elseif ($chk.StdOut -match 'No component store corruption') { Status $G.Ok 'component store' 'no corruption detected' $Clr.Green }
+elseif ($chk.StdOut -match 'repairable') {
+    $script:ImageSick = $true
+    Status $G.Warn 'component store' 'repairable corruption detected' $Clr.Orange
+    $script:Ledger.Symptoms.Add('component store corruption')
+} else { Status $G.Warn 'component store' "DISM exit $($chk.ExitCode) — inconclusive" $Clr.Orange }
+
+# 14 — packages parked mid-transaction
+$script:StuckPkgs = @()
+$pkg = Invoke-Guarded -File 'DISM.exe' -Arguments '/Online /Get-Packages /Format:Table' -Label 'sweeping package state' -TimeoutSec $Alkahest.PkgScanTimeoutSec
+if (-not $pkg.Skipped -and $pkg.StdOut) {
+    foreach ($l in ($pkg.StdOut -split "`n")) {
+        if ($l -match 'Install Pending|Uninstall Pending|Superseded Pending') { $script:StuckPkgs += $l.Trim() }
+    }
+}
+if ($script:StuckPkgs.Count -gt 0) {
+    Status $G.Warn 'stuck packages' "$($script:StuckPkgs.Count) in a pending state" $Clr.Orange
+    Note @(
+        'a package in Install Pending is waiting on a restart to finish its',
+        'transaction. that is a reboot, not a reset. still pending after a clean',
+        'restart means the component store is the problem.'
+    )
+    $script:Ledger.Symptoms.Add("$($script:StuckPkgs.Count) packages pending")
+} elseif (-not $pkg.Skipped) {
+    Status $G.Ok 'stuck packages' 'none pending' $Clr.Green
+}
+
+if (-not $script:Ledger.Proceed) {
+    Rule 'HALTED'
+    Status $G.Fail 'alkahest' 'run this from an elevated prompt — nothing was touched' $Clr.Red
+    try { Stop-Transcript -ErrorAction SilentlyContinue | Out-Null } catch {}
+    $global:AlkahestExit = 2
+    return
+}
+
+# ═══════════════════════════════════════════════════════════════
+#  QUENCH  —  halt the update stack before dissolving anything
+# ═══════════════════════════════════════════════════════════════
+Rule 'QUENCH'
+foreach ($n in @('UsoSvc','DoSvc','wuauserv','bits','cryptsvc','msiserver')) {
+    $nice = ($script:SvcSpec | Where-Object { $_.Name -eq $n }).Nice
+    if (-not $nice) { $nice = $n }
+    Stop-UpdateService $n $nice
+}
+
+# ═══════════════════════════════════════════════════════════════
+#  DISSOLVE  —  rename the poisoned caches. nothing is deleted.
+# ═══════════════════════════════════════════════════════════════
+Rule 'DISSOLVE'
+
+# in-box BITS cmdlets, deliberately not bitsadmin.exe
+if (Get-Command Remove-BitsTransfer -ErrorAction SilentlyContinue) {
+    try {
+        $jobs = @(Get-BitsTransfer -AllUsers -ErrorAction Stop)
+        if ($jobs.Count -eq 0)    { Status $G.Ok 'BITS queue' 'already empty' $Clr.Green }
+        elseif ($Alkahest.DryRun) { Status $G.Skip 'BITS queue' "would cancel $($jobs.Count) jobs" $Clr.Grey }
+        else {
+            $jobs | Remove-BitsTransfer -ErrorAction SilentlyContinue
+            Status $G.Work 'BITS queue' "cancelled $($jobs.Count) jobs" $Clr.Cyan
+        }
+    } catch { Status $G.Warn 'BITS queue' 'could not enumerate transfers' $Clr.Orange }
+} else { Status $G.Skip 'BITS queue' 'cmdlets unavailable' $Clr.Grey }
+
+$sdRenamed = Rename-Stale $script:SdPath 'softwaredistribution'
+if (-not $sdRenamed -and (Test-Path -LiteralPath $script:SdPath) -and -not $Alkahest.DryRun) {
+    foreach ($child in @('Download','DataStore')) {
+        $null = Rename-Stale (Join-Path $script:SdPath $child) "  fallback $child"
+    }
+    if ($Alkahest.ScheduleLocked) {
+        try {
+            $key = 'HKLM:\SYSTEM\CurrentControlSet\Control\Session Manager'
+            $cur = @(Get-RegValue $key 'PendingFileRenameOperations')
+            $src = '\??\' + $script:SdPath
+            $dst = '!\??\' + $script:SdPath + '.old.' + (Get-Date -Format 'yyyyMMdd_HHmmss')
+            Set-ItemProperty -Path $key -Name 'PendingFileRenameOperations' -Value ($cur + @($src,$dst)) -Type MultiString -ErrorAction Stop
+            Status $G.Work 'queued for next boot' 'rename scheduled via PendingFileRenameOperations' $Clr.Cyan
+            $script:Ledger.Warnings.Add('A RENAME IS QUEUED FOR NEXT BOOT — it only happens if the machine is actually restarted')
+        } catch { Status $G.Fail 'queued for next boot' 'could not write the pending-rename key' $Clr.Red }
+    }
+}
+
+$null = Rename-Stale $script:CatPath 'catroot2'
+
+if (Get-Command Delete-DeliveryOptimizationCache -ErrorAction SilentlyContinue) {
+    if ($Alkahest.DryRun) { Status $G.Skip 'delivery optimization' 'would purge cache' $Clr.Grey }
+    else {
+        try {
+            Delete-DeliveryOptimizationCache -Force -ErrorAction Stop
+            Status $G.Work 'delivery optimization' 'cache purged' $Clr.Cyan
+        } catch { Status $G.Warn 'delivery optimization' 'refused (service state or policy)' $Clr.Orange }
+    }
+} else { Status $G.Skip 'delivery optimization' 'cmdlet not on this build' $Clr.Grey }
+
+# the deliberate omissions, stated out loud rather than silently skipped
+Status $G.Skip 'regsvr32 re-register' 'not attempted by design — Panda blocks it' $Clr.Grey
+Status $G.Skip 'bitsadmin/wusa/sc' 'not attempted by design — EDR-flagged LOLBins' $Clr.Grey
+Status $G.Ok  'sacred' 'user files + recycle bin — untouched, always' $Clr.Green
+
+# ═══════════════════════════════════════════════════════════════
+#  RECONSTITUTE  —  put the machinery back the way Windows expects
+# ═══════════════════════════════════════════════════════════════
+Rule 'RECONSTITUTE'
+$repairResult = 'not run'      # not run | repaired | failed | skipped
+$sfcResult    = 'not run'
+
+foreach ($svc in $script:SvcSpec) {
+    $st = $script:SvcState[$svc.Name]
+    if (-not $st) { continue }
+    if ($st.StartMode -eq 'Disabled' -or ($st.StartMode -eq 'Auto' -and $svc.Want -eq 'Manual')) {
+        if ($Alkahest.DryRun) { Status $G.Skip "$($svc.Nice) start" "would set $($svc.Want)" $Clr.Grey; continue }
+        try {
+            Set-Service -Name $svc.Name -StartupType $svc.Want -ErrorAction Stop
+            Status $G.Work "$($svc.Nice) start" "$($st.StartMode) → $($svc.Want)" $Clr.Cyan
+        } catch { Status $G.Warn "$($svc.Nice) start" "could not set $($svc.Want)" $Clr.Orange }
+    } else {
+        Status $G.Ok "$($svc.Nice) start" $st.StartMode $Clr.Green
+    }
+}
+
+foreach ($t in $script:BadTasks) {
+    if ($Alkahest.DryRun) { Status $G.Skip "task $($t.TaskName)" 'would enable' $Clr.Grey; continue }
+    try {
+        Enable-ScheduledTask -TaskName $t.TaskName -TaskPath $t.TaskPath -ErrorAction Stop | Out-Null
+        Status $G.Work "task $($t.TaskName)" 'enabled' $Clr.Cyan
+    } catch { Status $G.Warn "task $($t.TaskName)" 'refused — held by policy or Update Medic' $Clr.Orange }
+}
+
+if ($Alkahest.ClearPolicy -and $script:Policy.Count -gt 0) {
+    $backup = Join-Path $Alkahest.LogRoot ("wu_policy_{0}_{1}.reg" -f $env:COMPUTERNAME, (Get-Date -Format 'yyyyMMdd_HHmmss'))
+    if ($Alkahest.DryRun) { Status $G.Skip 'group policy (WU)' "would back up to $backup then remove" $Clr.Grey }
+    else {
+        $exp = Invoke-Guarded -File 'reg.exe' -Arguments "export `"HKLM\SOFTWARE\Policies\Microsoft\Windows\WindowsUpdate`" `"$backup`" /y" -Label 'exporting policy backup' -TimeoutSec 120
+        if ($exp.ExitCode -eq 0) {
+            try {
+                Remove-Item -Path $polPath -Recurse -Force -ErrorAction Stop
+                Status $G.Work 'group policy (WU)' "removed · backup at $backup" $Clr.Cyan
+                Note @(
+                    'do not assume this reapplies on its own.',
+                    'AD GPO  — yes, own cycle (90 min default) or gpupdate /force.',
+                    'Intune rings — different key, never touched here.',
+                    'Intune ADMX — lands in this key, and MDM is not documented to re-push',
+                    '  a locally deleted value. re-save or re-assign the profile to force it.',
+                    'restore path is the .reg above. device check-in is ~8h, floor 6.5h.'
+                )
+                $script:Ledger.Warnings.Add("WU GROUP POLICY REMOVED — restore from $backup if that was wrong")
+            } catch { Status $G.Fail 'group policy (WU)' 'export succeeded but removal was refused' $Clr.Red }
+        } else { Status $G.Fail 'group policy (WU)' 'backup export failed — nothing was removed' $Clr.Red }
+    }
+}
+
+if ($Alkahest.ServicingRepair -and ($script:ImageSick -or $script:StuckPkgs.Count -gt 0 -or $script:WuErrCount -gt 0)) {
+    $r = Invoke-Guarded -File 'DISM.exe' -Arguments '/Online /Cleanup-Image /RestoreHealth' -Label 'DISM RestoreHealth' -TimeoutSec $Alkahest.DismRestoreTimeoutSec -ShowNative
+    if ($r.Skipped)      { $repairResult = 'skipped'; Status $G.Skip 'DISM restorehealth' 'skipped by operator' $Clr.Grey }
+    elseif ($r.ExitCode -eq 0) { $repairResult = 'repaired'; Status $G.Work 'DISM restorehealth' 'completed' $Clr.Cyan }
+    else {
+        $repairResult = 'failed'
+        Status $G.Fail 'DISM restorehealth' "exit $($r.ExitCode)" $Clr.Red
+        $script:Ledger.Warnings.Add('RESTOREHEALTH FAILED — with no reachable source DISM has nowhere to pull payloads; an install.wim of the same build passed with /Source is the offline path')
+    }
+    if ($repairResult -ne 'skipped') {
+        # -ShowNative means stdout is NOT redirected, so the verdict cannot come from
+        # StdOut. Read the CBS.log delta instead — same technique as Panacea's MEND.
+        $sfcArgs = if ($Alkahest.DryRun) { '/verifyonly' } else { '/scannow' }
+        Status $G.Work 'sfc' 'verifying system files — SFC output follows' $Clr.Cyan
+        Write-Host ''
+        $cbsPath = "$env:SystemRoot\Logs\CBS\CBS.log"
+        $cbsBefore = if (Test-Path $cbsPath) { (Get-Item $cbsPath).Length } else { 0 }
+
+        $s = Invoke-Guarded -File "$env:SystemRoot\System32\sfc.exe" -Arguments $sfcArgs -Label 'sfc' -TimeoutSec $Alkahest.SfcTimeoutSec -ShowNative
+
+        if ($s.Skipped) { $sfcResult = 'skipped'; Status $G.Skip 'sfc' 'skipped by operator' $Clr.Grey }
+        elseif ($s.TimedOut) { $sfcResult = 'timed out'; Status $G.Fail 'sfc' 'timed out' $Clr.Red }
+        else {
+            $cbsNew = ''
+            try {
+                if (Test-Path $cbsPath) {
+                    $fs = [IO.File]::Open($cbsPath,'Open','Read','ReadWrite')
+                    [void]$fs.Seek($cbsBefore,'Begin')
+                    $rdr = New-Object IO.StreamReader($fs)
+                    $cbsNew = $rdr.ReadToEnd()
+                    $rdr.Close(); $fs.Close()
+                }
+            } catch {}
+            if ($cbsNew -match 'Cannot repair member file' -or $cbsNew -match '\[SR\].+cannot repair') {
+                $sfcResult = 'unfixable'
+                Status $G.Fail 'sfc' 'found damage it could NOT fix' $Clr.Red
+                $script:Ledger.Symptoms.Add('SFC found unfixable corruption')
+                $script:Ledger.Warnings.Add('SFC FOUND UNFIXABLE DAMAGE — investigate before reimage')
+            } elseif ($cbsNew -match '\[SR\] Repairing \d+ components' -and $cbsNew -notmatch 'Repairing 0 components') {
+                $sfcResult = 'repaired'
+                Status $G.Work 'sfc' 'violations found and repaired' $Clr.Cyan
+            } elseif ($cbsNew -match '\[SR\] Verify complete' -or $s.ExitCode -eq 0) {
+                $sfcResult = 'clean'
+                Status $G.Ok 'sfc' 'no integrity violations' $Clr.Green
+            } else {
+                $sfcResult = "exit $($s.ExitCode)"
+                Status $G.Warn 'sfc' "finished (exit $($s.ExitCode)) — verdict unclear, see CBS.log" $Clr.Orange
+            }
+        }
+    }
+} else {
+    Status $G.Skip 'servicing repair' 'store looked clean, or disabled in setup' $Clr.Grey
+}
+
+if ($Alkahest.RunWinSxS) {
+    $wsx = Invoke-Guarded -File 'DISM.exe' -Arguments '/Online /Cleanup-Image /StartComponentCleanup' -Label 'component cleanup' -TimeoutSec $Alkahest.WinSxSTimeoutSec -ShowNative
+    if ($wsx.Skipped)          { Status $G.Skip 'winsxs cleanup' 'skipped by operator' $Clr.Grey }
+    elseif ($wsx.ExitCode -eq 0) { Status $G.Work 'winsxs cleanup' 'superseded payloads reclaimed' $Clr.Cyan }
+    elseif ($wsx.ExitCode -eq 5) { Status $G.Ok 'winsxs cleanup' 'already trimmed — nothing to clean' $Clr.Green }
+    else { Status $G.Warn 'winsxs cleanup' "exit $($wsx.ExitCode)" $Clr.Orange }
+} else {
+    Status $G.Skip 'winsxs cleanup' 'disabled in config' $Clr.Grey
+}
+
+# ═══════════════════════════════════════════════════════════════
+#  PROGNOSIS  —  restart the stack, ask for a scan, then the label:
+#                plain roll-up, conditional orange sticker.
+# ═══════════════════════════════════════════════════════════════
+Rule 'PROGNOSIS'
+
+foreach ($n in @('cryptsvc','bits','wuauserv','UsoSvc','DoSvc')) {
+    if (-not $script:SvcState.ContainsKey($n)) { continue }
+    if ($Alkahest.DryRun) { Status $G.Skip "start $n" 'would start' $Clr.Grey; continue }
+    try {
+        Start-Service -Name $n -ErrorAction Stop
+        Status $G.Work "start $n" 'running' $Clr.Cyan
+    } catch {
+        $s = Get-Service -Name $n -ErrorAction SilentlyContinue
+        if ($s -and $s.StartType -eq 'Manual') { Status $G.Ok "start $n" 'trigger-start, runs on demand' $Clr.Green }
+        else { Status $G.Warn "start $n" 'did not start' $Clr.Orange }
+    }
+}
+
+# ask for a detection pass. report that it was ASKED FOR, never that the box is
+# current — under SYSTEM the COM search can no-op silently and "current" would lie.
+$scanAsked = $false
+if (-not $Alkahest.DryRun) {
+    try {
+        $au = New-Object -ComObject Microsoft.Update.AutoUpdate
+        $au.DetectNow()
+        $scanAsked = $true
+        Status $G.Work 'detection pass' 'requested via Microsoft.Update.AutoUpdate' $Clr.Cyan
+    } catch {
+        $uso = Join-Path $env:windir 'System32\UsoClient.exe'
+        if (Test-Path -LiteralPath $uso) {
+            $u = Invoke-Guarded -File $uso -Arguments 'StartScan' -Label 'orchestrator scan' -TimeoutSec 120
+            if ($u.ExitCode -eq 0) { $scanAsked = $true; Status $G.Work 'detection pass' 'requested via UsoClient' $Clr.Cyan }
+            else { Status $G.Warn 'detection pass' 'scan request returned an error' $Clr.Orange }
+        } else { Status $G.Warn 'detection pass' 'no way to request a scan on this build' $Clr.Orange }
+    }
+    if ($scanAsked) {
+        $script:Ledger.Warnings.Add('SCAN REQUESTED, NOT VERIFIED — watch Settings > Windows Update on the frontstage session before calling this fixed')
+    }
+}
+
+foreach ($k in $pendKeys) { if (Test-Path $k.P) { $script:Ledger.PendingAfter.Add($k.N) } }
+if (Get-RegValue 'HKLM:\SYSTEM\CurrentControlSet\Control\Session Manager' 'PendingFileRenameOperations') {
+    $script:Ledger.PendingAfter.Add('PendingFileRenameOperations')
+}
+
+$rebootNeeded = ($script:Ledger.PendingAfter.Count -gt 0) -or ($script:StuckPkgs.Count -gt 0) -or
+                ($repairResult -eq 'repaired') -or ($sfcResult -eq 'repaired')
+
+# overall status tag — same three-state language as Panacea's label
+if ($repairResult -eq 'failed' -or $sfcResult -eq 'unfixable' -or ($script:Ledger.Symptoms.Count -gt 0 -and $repairResult -eq 'failed')) {
+    $tag = "$($G.Bell) ATTENTION"; $tagColor = $Clr.Orange
+} elseif ($sdRenamed -or $repairResult -eq 'repaired' -or $sfcResult -eq 'repaired' -or $script:BitsCount -gt 0) {
+    $tag = "$($G.Staff) DISSOLVED"; $tagColor = $Clr.Cyan
+} else {
+    $tag = "$($G.Ok.Trim('[]')) CLEAR"; $tagColor = $Clr.Green
+    if ($script:VT) { $tag = "$($G.Staff) CLEAR" }
+}
+if ($Alkahest.DryRun) { $tag = "$($G.Skip) DRY RUN"; $tagColor = $Clr.Grey }
+
+$bar = '═' * 62; $mid = '─' * 62
+if (-not $script:VT) { $bar = '=' * 62; $mid = '-' * 62 }
+Write-Host ''
+Write-Host (Paint "╔$bar╗" -Fg $tagColor)
+$title = "  $($G.Rx)  PROGNOSIS"
+$pad = 62 - $title.Length - $tag.Length - 2
+if ($pad -lt 1) { $pad = 1 }
+Write-Host (Paint $title -Fg $tagColor) -NoNewline
+Write-Host (Paint ((' ' * $pad) + $tag + '  ') -Fg $tagColor)
+Write-Host (Paint "╟$mid╢" -Fg $Clr.Grey)
+
+# --- plain roll-up (flavor in labels, plain nouns in values) -----
+function Roll($label,$value) {
+    $dots = '.' * [Math]::Max(3, 16 - $label.Length)
+    Write-Host (Paint "  $label $dots $value" -Fg $Clr.Grey)
+}
+if ($sdRenamed) { Roll 'caches' 'softwaredistribution + catroot2 renamed' }
+else            { Roll 'caches' 'not renamed — locked or already clean' }
+switch ($repairResult) {
+    'repaired' { Roll 'store repair' 'completed (DISM)' }
+    'failed'   { Roll 'store repair' 'FAILED — see log' }
+    'skipped'  { Roll 'store repair' 'SKIPPED by operator' }
+    default    { Roll 'store repair' 'not needed' }
+}
+Roll 'sfc' $sfcResult
+if ($script:BitsCount -gt 0) { Roll 'bits queue' "$($script:BitsCount) jobs cleared" } else { Roll 'bits queue' 'empty' }
+if ($script:MdmPolicy.Count -gt 0) { Roll 'policy' "MDM ring active ($($script:MdmPolicy.Count) settings)" }
+elseif ($script:Policy.Count -gt 0) { Roll 'policy' 'group policy present' }
+else { Roll 'policy' 'none set' }
+if ($scanAsked) { Roll 'scan' 'requested — NOT verified' } else { Roll 'scan' 'not requested' }
+if ($script:Ledger.UptimeText) { Roll 'uptime' $script:Ledger.UptimeText }
+Roll 'free space' "$($script:Ledger.FreeGB) GB"
+
+# --- auxiliary warning strip — CONDITIONAL. absence = relief. ----
+$auxWarnings = @()
+if ($rebootNeeded) {
+    $why = @()
+    if ($script:StuckPkgs.Count -gt 0) { $why += "$($script:StuckPkgs.Count) pending packages" }
+    if ($script:Ledger.PendingAfter.Count -gt 0 -and $script:StuckPkgs.Count -eq 0) { $why += 'staged servicing' }
+    if ($repairResult -eq 'repaired' -or $sfcResult -eq 'repaired') { $why += 'repairs' }
+    $auxWarnings += "RESTART REQUIRED — " + ($why -join ' + ') + " will not complete until the machine is rebooted"
+}
+foreach ($w in $script:Ledger.Warnings) { $auxWarnings += $w.ToUpper() }
+
+if ($auxWarnings.Count -gt 0) {
+    Write-Host (Paint "╟$mid╢" -Fg $Clr.Grey)
+    if ($script:VT) {
+        Write-Host (Paint ("  {0}{0} AUXILIARY WARNINGS {0}{0}" -f [char]0x2593) -Fg $Clr.Orange)
+    } else {
+        Write-Host "  ## AUXILIARY WARNINGS ##"
+    }
+    foreach ($w in $auxWarnings) {
+        if ($script:VT) {
+            Write-Host (Paint "  $($G.Bell) $w " -Fg $Clr.Black -Bg $Clr.Orange)
+        } else {
+            Write-Host "  !! $w !!"
+        }
+    }
+} else {
+    Write-Host (Paint "╟$mid╢" -Fg $Clr.Grey)
+    Write-Host (Paint "  dispensed by ALKAHEST · keep out of reach of end users" -Fg $Clr.Grey)
+}
+Write-Host (Paint "╚$bar╝" -Fg $tagColor)
+
+# --- machine-readable summary for RMM ingest ---------------------
+$script:Ledger.Ended = Get-Date
+$summary = [ordered]@{
+    host           = $script:Ledger.Host
+    session        = $script:Ledger.Session
+    os             = $script:Ledger.OSBuild
+    started        = $script:Ledger.Started.ToString('s')
+    ended          = $script:Ledger.Ended.ToString('s')
+    dry_run        = [bool]$Alkahest.DryRun
+    uptime_days    = $script:Ledger.UptimeDays
+    free_gb        = $script:Ledger.FreeGB
+    panda_present  = [bool]$script:Ledger.PandaPresent
+    caches_renamed = [bool]$sdRenamed
+    bits_cleared   = $script:BitsCount
+    store_repair   = $repairResult
+    sfc            = $sfcResult
+    gpo_policy     = @($script:Policy.Keys)
+    mdm_policy     = @($script:MdmPolicy)
+    stuck_packages = $script:StuckPkgs.Count
+    wu_errors      = $script:WuErrCount
+    scan_requested = [bool]$scanAsked
+    pending_before = @($script:Ledger.PendingBefore)
+    pending_after  = @($script:Ledger.PendingAfter)
+    reboot_req     = [bool]$rebootNeeded
+    symptoms       = @($script:Ledger.Symptoms)
+    status         = ($tag -replace '[^A-Za-z]','')
+}
+try {
+    if ($script:LogFile) {
+        $jsonPath = [IO.Path]::ChangeExtension($script:LogFile,'json')
+        ($summary | ConvertTo-Json -Depth 4) | Out-File -FilePath $jsonPath -Encoding UTF8
+    }
+} catch {}
+
+# exit code contract: 0 clear, 1 reboot-needed, 2 needs-attention
+# stored in $global:AlkahestExit so RMM can read it; NO exit call so backstage stays alive
+try { Stop-Transcript -ErrorAction SilentlyContinue | Out-Null } catch {}
+if ($repairResult -eq 'failed' -or $sfcResult -eq 'unfixable') { $global:AlkahestExit = 2 }
+elseif ($rebootNeeded) { $global:AlkahestExit = 1 }
+else { $global:AlkahestExit = 0 }
 $exitVal = $global:AlkahestExit
 $logPath = $script:LogFile
 Write-Host ''
-Write-Host (Dim ("   dispensary closed  .  `$AlkahestExit = $exitVal  .  log: $logPath"))
-Write-Host (Dim  '   keep out of reach of end users')
-Write-Host ''
+Write-Host (Paint "   dispensary closed  ·  `$AlkahestExit = $exitVal  ·  log: $logPath" -Fg $Clr.Grey)
 '@
 
 [ScriptBlock]::Create($alkahest).Invoke()
