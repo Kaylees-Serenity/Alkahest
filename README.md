@@ -26,7 +26,7 @@ long step, `S` skips that step and moves on.
 | Step timeout | infinite | Slow boxes are the normal case, so nothing is cut by default |
 | Servicing repair | on | DISM RestoreHealth + SFC, only if the image actually looks sick |
 | Component cleanup | off | `StartComponentCleanup`, never `/ResetBase` |
-| Clear WU policy | **off** | Backs up then removes WSUS/GPO keys. Requires typing `CLEAR` |
+| Clear WU policy | **off** | Backs up then removes GPO-path WSUS keys. Requires typing `CLEAR` |
 | Queue locked work | off | If a cache is locked, schedule the rename for next boot |
 
 `$global:AlkahestExit` carries the verdict — `0` clear or dissolved, `1` partial, `2` needs a
@@ -54,6 +54,35 @@ so renames retry four times with backoff, fall back to renaming `Download` and `
 individually, and then report **BLOCKED** rather than forcing anything. A blocked step never
 kills the run.
 
+## Update policy: GPO vs Intune
+
+The "Clear WU policy" option touches exactly one key,
+`HKLM\SOFTWARE\Policies\Microsoft\Windows\WindowsUpdate`. It is worth knowing what that
+does and does not reach before arming it.
+
+| Source | Writes where | Comes back on its own? |
+|---|---|---|
+| Active Directory GPO | `SOFTWARE\Policies\...\WindowsUpdate` | **Yes.** Own cycle, 90 min by default, or `gpupdate /force` |
+| Intune Update rings | `SOFTWARE\Microsoft\PolicyManager\...\Update` | Not applicable — this option never touches that key |
+| Intune ADMX / Administrative Templates | `SOFTWARE\Policies\...\WindowsUpdate` | **Do not assume it.** See below |
+
+Microsoft documents the two registry paths as separate
+([Configure Windows Update client policies](https://learn.microsoft.com/windows/deployment/update/waas-configure-wufb#summary-mdm-and-group-policy-settings-for-windows-10,-version-1703-and-later)),
+and nothing in the docs promises that MDM re-pushes a value that was deleted locally while the
+policy itself is unchanged. A routine device sync may simply see the policy as already applied.
+The reliable restore is the `.reg` backup, or editing and re-saving the profile in Intune to
+force a change-based push.
+
+Check-in cadence, for setting expectations on a call: maintenance sync roughly every 8 hours,
+and no more than one every 6.5 hours
+([policy refresh intervals](https://learn.microsoft.com/intune/device-configuration/troubleshoot-device-profiles#policy-refresh-intervals)).
+Faster: **Settings > Accounts > Access work or school > Info > Sync**, or the Sync action in
+the Intune admin center.
+
+DIAGNOSE reads the PolicyManager path too and reports it, because a ring-managed box with an
+empty GPO key would otherwise be reported as having no update policy at all. Deferrals, pauses
+and a pinned target release version look exactly like a stuck update stack.
+
 ## What it will not do
 
 - **Delete.** Caches are renamed to `.old.<timestamp>`, so every step is reversible.
@@ -61,9 +90,9 @@ kills the run.
 - **Touch a staged CBS transaction.** `pending.xml`, `SessionsPending.xml` and the
   PackagesPending key are reported, never cleared. Clearing those by hand is how a machine
   gets a half-installed component store.
-- **Clear WSUS/Intune policy silently.** MSP clients point at WSUS on purpose. Policy is
-  reported by default; removal is opt-in, backed up to `.reg` first, and refuses to proceed
-  if the backup fails.
+- **Clear update policy silently.** MSP clients point at WSUS on purpose. Policy is reported
+  by default; removal is opt-in, backed up to `.reg` first, and refuses to proceed if the
+  backup fails. See the note below on what that option does and does not reach.
 - **Claim the machine is up to date.** It requests a detection pass and reports that it
   *asked*. Under SYSTEM the COM search can no-op silently, and a "current" verdict from here
   would be a lie.

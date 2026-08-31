@@ -305,8 +305,9 @@ function Show-Setup {
             }
             '5' {
                 if (-not $script:Cfg.ClearPolicyKeys) {
-                    Write-Host ('   ' + (Amber 'This client may run WSUS or Intune on purpose. Removing those keys'))
-                    Write-Host ('   ' + (Amber 'takes the machine off its managed patch source until policy reapplies.'))
+                    Write-Host ('   ' + (Amber 'This client may point at WSUS on purpose. AD GPO rewrites this key on'))
+                    Write-Host ('   ' + (Amber 'its own cycle; MDM is NOT documented to re-push a locally deleted value.'))
+                    Write-Host ('   ' + (Amber 'Assume the .reg backup is the only way back until proven otherwise.'))
                     $y = Read-Host '   type CLEAR to arm it'
                     if ($y -eq 'CLEAR') { $script:Cfg.ClearPolicyKeys = $true }
                 } else { $script:Cfg.ClearPolicyKeys = $false }
@@ -511,6 +512,33 @@ not on this endpoint.
         Write-Step 'update policy' 'ok' 'no WSUS/GPO update keys set'
     }
 
+    # Intune Update rings do not live in the Policies key above. Read the MDM
+    # path too, or a ring-managed box reports "no policy" and lies to the tech.
+    $mdmPath = 'HKLM:\SOFTWARE\Microsoft\PolicyManager\default\Update'
+    $script:MdmPolicy = @()
+    if (Test-Path $mdmPath) {
+        try {
+            $script:MdmPolicy = @(Get-ChildItem -Path $mdmPath -ErrorAction Stop |
+                Select-Object -ExpandProperty PSChildName)
+        } catch { }
+    }
+    if ($script:MdmPolicy.Count -gt 0) {
+        Write-Step 'MDM update policy' 'warn' ("{0} settings under PolicyManager (Intune ring or similar)" -f $script:MdmPolicy.Count)
+        Add-Advisory 'This box is under MDM update policy' @"
+$(($script:MdmPolicy | Sort-Object | Select-Object -First 12) -join ', ')
+
+Read from HKLM\SOFTWARE\Microsoft\PolicyManager\default\Update. ALKAHEST does
+not touch this key and the "Clear WU policy" option does not either - that option
+only clears HKLM\SOFTWARE\Policies\Microsoft\Windows\WindowsUpdate.
+
+Deferrals, pauses and a target release version set here will hold updates back and
+look exactly like a stuck stack. Check the assigned ring in Intune before chasing
+this any further on the endpoint.
+"@
+    } else {
+        Write-Step 'MDM update policy' 'ok' 'no PolicyManager update settings'
+    }
+
     # --- orchestrator tasks
     $script:BadTasks = @()
     if (Get-Command Get-ScheduledTask -ErrorAction SilentlyContinue) {
@@ -705,7 +733,24 @@ function Invoke-Reconstitute {
                 try {
                     Remove-Item -Path $polPath -Recurse -Force -ErrorAction Stop
                     Write-Step 'WU policy keys' 'fixed' "removed - backup at $backup"
-                    Add-Advisory 'Update policy was removed' "A .reg backup is at $backup. If this tenant runs WSUS or Intune, the next policy refresh will put these keys straight back. Restore the backup if the removal was a mistake."
+                    Add-Advisory 'Update policy was removed' @"
+A .reg backup is at $backup. Do not assume this reapplies on its own.
+
+  Active Directory GPO  - yes. Rewrites this key on its own cycle (90 min by
+                          default) or immediately on gpupdate /force.
+  Intune Update rings   - not from here. Rings write to PolicyManager, a
+                          different key this option never touched.
+  Intune ADMX / Admin
+  Templates profiles    - these DO land in this key, and Microsoft does not
+                          document MDM re-pushing a value deleted locally while
+                          the policy itself is unchanged. A plain device sync may
+                          not bring it back. Editing and re-saving the profile, or
+                          re-assigning it, forces a change-based push that will.
+
+Device check-in is roughly every 8 hours, and no more than one maintenance sync
+per 6.5 hours. Settings > Accounts > Access work or school > Info > Sync, or the
+Sync action in the Intune admin center, is the fast path.
+"@
                 } catch { Write-Step 'WU policy keys' 'fail' 'export succeeded but removal was refused' }
             } else { Write-Step 'WU policy keys' 'fail' 'backup export failed - nothing was removed' }
         }
