@@ -24,6 +24,10 @@ $Alkahest = [ordered]@{
     RunWinSxS       = $false       # DISM StartComponentCleanup (never /ResetBase)
     ClearPolicy     = $false       # OFF. clients run WSUS/Intune on purpose. arms with CLEAR
     ScheduleLocked  = $false       # if a cache is locked, queue the rename for next boot
+    ForceDownload   = $true        # after the reset, pull pending updates down and read back each one
+    # the one ceiling that is NOT infinite: a download that has not finished in two
+    # hours is stuck, not slow. independent of the [4] Timeouts cycle.
+    WuDownloadTimeoutSec  = 7200
     # long-running operation ceilings (seconds) — 0 = infinite (default; rely on Windows).
     # slow boxes are the norm; the S-key still gives instant bail on any long op.
     DismCheckTimeoutSec   = 0
@@ -189,6 +193,11 @@ function Show-Setup {
         } else {
             $lckV = 'OFF'; $lckHint = 'will report a locked cache and move on'
         }
+        if ($Alkahest.ForceDownload) {
+            $fdV = 'ON '; $fdHint = 'will download pending updates to prove it worked'
+        } else {
+            $fdV = 'OFF'; $fdHint = 'will only ask Windows to scan'
+        }
 
         Write-Host (Paint "   [1] DryRun ............ $dryV   $dryHint" -Fg $Clr.Grey)
         Write-Host (Paint "   [2] Servicing repair .. $svcV   $svcHint" -Fg $Clr.Grey)
@@ -196,6 +205,7 @@ function Show-Setup {
         Write-Host (Paint "   [4] Timeouts .......... $toV  $toHint" -Fg $Clr.Grey)
         Write-Host (Paint "   [5] Clear WU policy ... $polV   $polHint" -Fg $Clr.Grey)
         Write-Host (Paint "   [6] Queue locked work . $lckV   $lckHint" -Fg $Clr.Grey)
+        Write-Host (Paint "   [7] Force download .... $fdV   $fdHint" -Fg $Clr.Grey)
         Write-Host ''
         Write-Host (Paint "   [Enter] proceed  ·  [Q] quit  ·  S skips any long step once running" -Fg $Clr.Cyan)
         Write-Host (Paint "    > " -Fg $Clr.Cyan) -NoNewline
@@ -214,6 +224,7 @@ function Show-Setup {
         elseif ($c -eq '2') { $Alkahest.ServicingRepair = -not $Alkahest.ServicingRepair }
         elseif ($c -eq '3') { $Alkahest.RunWinSxS       = -not $Alkahest.RunWinSxS }
         elseif ($c -eq '6') { $Alkahest.ScheduleLocked  = -not $Alkahest.ScheduleLocked }
+        elseif ($c -eq '7') { $Alkahest.ForceDownload   = -not $Alkahest.ForceDownload }
         elseif ($c -eq '4') {
             if ($Alkahest.DismRestoreTimeoutSec -eq 0) {
                 $Alkahest.DismCheckTimeoutSec   = 300
@@ -363,6 +374,174 @@ function Invoke-Guarded {
         Skipped  = $skipped
         StdOut   = $sbOut.ToString()
         StdErr   = $sbErr.ToString()
+    }
+}
+
+# ═══════════════════════════════════════════════════════════════
+#  WU RUNNER  —  Windows Update search/download/install on a worker
+#               thread, so a stuck download can be walked away from
+# ═══════════════════════════════════════════════════════════════
+# WUA's Download() blocks until Windows Update gives up, which on a wedged
+# stack is never. BeginDownload would fix that but needs a compiled COM
+# callback (Add-Type → csc.exe, an EDR-flagged LOLBin), so the plain calls run
+# in their own runspace and this thread watches the clock instead. Every WUA
+# object is created and used on that one worker thread; no COM crosses threads.
+# Same contract as Invoke-Guarded: S skips, a ceiling of 0 means infinite.
+# Mode: 'search' (report only) · 'download' (stage, no install) · 'install'
+function Invoke-WuPipeline {
+    param(
+        [ValidateSet('search','download','install')][string]$Mode = 'install',
+        [int]$DownloadTimeoutSec = 7200,
+        [string]$Label = 'windows update'
+    )
+    $state = [hashtable]::Synchronized(@{
+        Phase = 'search'; PhaseStarted = [DateTime]::UtcNow; Abandon = $false
+        SearchMs = 0; Found = @(); Downloaded = @(); Failed = @()
+        InstallCode = -1; RebootRequired = $false; Error = $null
+    })
+
+    $work = {
+        param($state, $mode)
+        # phase change and the watcher's abandon decision share one lock, so the
+        # worker can never start installing in the gap after the watcher gave up
+        function Enter-Phase($name) {
+            [System.Threading.Monitor]::Enter($state.SyncRoot)
+            try {
+                if ($state.Abandon) { return $false }
+                $state.Phase = $name; $state.PhaseStarted = [DateTime]::UtcNow
+                return $true
+            } finally { [System.Threading.Monitor]::Exit($state.SyncRoot) }
+        }
+        try {
+            $session  = New-Object -ComObject Microsoft.Update.Session
+            $searcher = $session.CreateUpdateSearcher()
+            $sw = [System.Diagnostics.Stopwatch]::StartNew()
+            # IsInstalled=0, software type, not hidden. Drivers & feature-upgrades fenced off by default.
+            $res = $searcher.Search("IsInstalled=0 and Type='Software' and IsHidden=0")
+            $sw.Stop(); $state.SearchMs = [int]$sw.ElapsedMilliseconds
+
+            $coll = New-Object -ComObject Microsoft.Update.UpdateColl
+            $kbs  = @()
+            foreach ($u in $res.Updates) {
+                # hard-exclude feature/upgrade packages — a paste tool never rides a build upgrade
+                if ($u.Title -match 'Feature update|Upgrade to Windows|\b2[0-9]H[12]\b') { continue }
+                [void]$coll.Add($u)
+                $kb = ($u.KBArticleIDs | ForEach-Object { "KB$_" }) -join ','
+                if (-not $kb) { $kb = '(no KB)' }
+                $kbs += $kb
+            }
+            $state.Found = $kbs
+            if ($mode -eq 'search' -or $coll.Count -eq 0) { return }
+
+            if (-not (Enter-Phase 'download')) { return }
+            $dl = $session.CreateUpdateDownloader(); $dl.Updates = $coll
+            $dlRes = $dl.Download()
+
+            # read every update's own verdict — the batch code can say "succeeded"
+            # with half the payloads missing, and installing those is what wedges
+            $ready = New-Object -ComObject Microsoft.Update.UpdateColl
+            $okKbs = @(); $badKbs = @()
+            for ($i = 0; $i -lt $coll.Count; $i++) {
+                $u = $coll.Item($i)
+                $r = $dlRes.GetUpdateResult($i)
+                # ResultCode 2 = succeeded, 3 = succeeded w/ errors
+                if ($r.ResultCode -eq 2 -or $r.ResultCode -eq 3 -or $u.IsDownloaded) {
+                    [void]$ready.Add($u); $okKbs += $kbs[$i]
+                } else {
+                    $badKbs += ('{0} (0x{1:X8})' -f $kbs[$i], $r.HResult)
+                }
+            }
+            $state.Downloaded = $okKbs; $state.Failed = $badKbs
+            if ($mode -eq 'download' -or $ready.Count -eq 0) { return }
+
+            if (-not (Enter-Phase 'install')) { return }
+            # install (reboot suppressed — WUA won't force restart from here)
+            $inst = $session.CreateUpdateInstaller(); $inst.Updates = $ready
+            $instRes = $inst.Install()
+            $state.InstallCode    = [int]$instRes.ResultCode
+            $state.RebootRequired = [bool]$instRes.RebootRequired
+        } catch {
+            $state.Error = $_.Exception.Message.Split("`n")[0]
+        }
+    }
+
+    $rs = [runspacefactory]::CreateRunspace()
+    $rs.ApartmentState = 'STA'          # the apartment the console thread gave WUA before
+    $rs.ThreadOptions  = 'ReuseThread'
+    $rs.Open()
+    $ps = [powershell]::Create(); $ps.Runspace = $rs
+    [void]$ps.AddScript($work.ToString()).AddArgument($state).AddArgument($Mode)
+    $handle = $ps.BeginInvoke()
+
+    $canSkip = $false
+    try { $canSkip = -not [Console]::IsInputRedirected } catch { $canSkip = $false }
+    if ($script:VT) { $frames = @([char]0x280B,[char]0x2819,[char]0x2839,[char]0x2838,[char]0x283C,[char]0x2834,[char]0x2826,[char]0x2827,[char]0x2807,[char]0x280F) }
+    else            { $frames = @('|','/','-','\') }
+    $frameIdx = 0; $seen = 'search'; $outcome = 'done'
+
+    while (-not $handle.IsCompleted) {
+        $phase = $state.Phase
+        if ($phase -ne $seen) {
+            try { [Console]::Write("`r" + (' ' * 72) + "`r") } catch {}
+            if ($phase -eq 'download') { Status $G.Work $Label "$($state.Found.Count) found → downloading..." $Clr.Cyan }
+            if ($phase -eq 'install')  { Status $G.Work $Label "$($state.Downloaded.Count) downloaded → installing (reboot suppressed)..." $Clr.Cyan }
+            $seen = $phase
+        }
+        $inPhase = [DateTime]::UtcNow - $state.PhaseStarted
+
+        $giveUp = $null
+        if ($phase -eq 'download' -and $DownloadTimeoutSec -gt 0 -and $inPhase.TotalSeconds -ge $DownloadTimeoutSec) { $giveUp = 'stalled' }
+        if ($canSkip -and $phase -ne 'install') {
+            try {
+                if ([Console]::KeyAvailable) {
+                    $k = [Console]::ReadKey($true)
+                    if ($k.KeyChar -eq 's' -or $k.KeyChar -eq 'S') { $giveUp = 'skipped' }
+                }
+            } catch {}
+        }
+        if ($giveUp) {
+            # an install already under way is never abandoned — walking off mid-install
+            # would report "skipped" while Windows keeps installing behind our back
+            [System.Threading.Monitor]::Enter($state.SyncRoot)
+            try {
+                if ($state.Phase -ne 'install') { $state.Abandon = $true; $outcome = $giveUp }
+            } finally { [System.Threading.Monitor]::Exit($state.SyncRoot) }
+            if ($state.Abandon) { break }
+        }
+
+        $elapsed = "{0:mm\:ss}" -f $inPhase
+        $spin = $frames[$frameIdx % $frames.Count]
+        if ($phase -eq 'install') { $hint = 'installing — not skippable' }
+        elseif ($canSkip)         { $hint = 'press S to skip' }
+        else                      { $hint = 'running' }
+        $line = "      $spin  $Label · $phase  ·  $elapsed  ·  $hint"
+        try { [Console]::Write("`r" + $line.PadRight(70)) } catch {}
+        $frameIdx++
+        Start-Sleep -Milliseconds 250
+    }
+    try { [Console]::Write("`r" + (' ' * 72) + "`r") } catch {}
+
+    $phaseSec = [int]([DateTime]::UtcNow - $state.PhaseStarted).TotalSeconds
+    if ($outcome -eq 'done') {
+        try { [void]$ps.EndInvoke($handle) } catch { if (-not $state.Error) { $state.Error = $_.Exception.Message.Split("`n")[0] } }
+        try { $ps.Dispose(); $rs.Dispose() } catch {}
+    } else {
+        # the worker is parked inside a WUA call nothing can cancel from here.
+        # ask it to stop and leave it — Dispose would block on that same call.
+        try { [void]$ps.BeginStop($null, $null) } catch {}
+    }
+
+    [pscustomobject]@{
+        Outcome        = $outcome          # done | stalled | skipped
+        Phase          = $state.Phase      # where it was when it ended
+        PhaseSec       = $phaseSec
+        SearchMs       = $state.SearchMs
+        Found          = @($state.Found)
+        Downloaded     = @($state.Downloaded)
+        Failed         = @($state.Failed)  # 'KBnnnn (0xHRESULT)'
+        InstallCode    = $state.InstallCode
+        RebootRequired = $state.RebootRequired
+        Error          = $state.Error
     }
 }
 
@@ -925,6 +1104,59 @@ foreach ($n in @('cryptsvc','bits','wuauserv','UsoSvc','DoSvc')) {
     }
 }
 
+# force the stuck download through. a scan request only ASKS; this pulls every
+# pending payload now and reads back each one, so "unstuck" rests on evidence.
+# download only — installing is Panacea's job. runs before the scan request so
+# Settings refreshes onto staged updates instead of a stale "downloading".
+$fdState = 'not run'; $fdOk = @(); $fdBad = @(); $fdStuck = $false
+if ($Alkahest.ForceDownload) {
+    $fdMode = if ($Alkahest.DryRun) { 'search' } else { 'download' }
+    Status $G.Work 'force download' 'searching (quality + servicing, no drivers/feature)...' $Clr.Cyan
+    try {
+        $fd = Invoke-WuPipeline -Mode $fdMode -DownloadTimeoutSec $Alkahest.WuDownloadTimeoutSec -Label 'force download'
+        $fdOk = @($fd.Downloaded); $fdBad = @($fd.Failed)
+        $fdMins = [Math]::Round($fd.PhaseSec / 60)
+        if ($fd.Error) {
+            Status $G.Fail 'force download' "WUA error: $($fd.Error)" $Clr.Red
+            $script:Ledger.Symptoms.Add("forced download errored — $($fd.Error)")
+            $fdState = 'failed'; $fdStuck = $true
+        } elseif ($fd.Outcome -ne 'done' -and $fd.Phase -eq 'download') {
+            if ($fd.Outcome -eq 'stalled') {
+                Status $G.Fail 'force download' "still stuck after $fdMins min — the cache was not the cause" $Clr.Red
+            } else {
+                Status $G.Skip 'force download' "skipped by user after $fdMins min — unproven" $Clr.Grey
+            }
+            $script:Ledger.Warnings.Add('DOWNLOAD STILL STUCK AFTER THE RESET — look past this endpoint: network path, proxy, WSUS, or Delivery Optimization')
+            $fdState = 'still stuck'; $fdStuck = $true
+        } elseif ($fd.Outcome -ne 'done') {
+            Status $G.Skip 'force download' 'search skipped by user' $Clr.Grey
+            $fdState = 'skipped'
+        } elseif ($fd.Found.Count -eq 0) {
+            # zero offered is not proof of health — same SYSTEM caveat as the scan request
+            Status $G.Skip 'force download' "nothing offered (search $($fd.SearchMs)ms) — not proof the box is current" $Clr.Grey
+            $fdState = 'none offered'
+        } elseif ($Alkahest.DryRun) {
+            Status $G.Skip 'force download' "would download $($fd.Found.Count): $($fd.Found -join ', ')" $Clr.Grey
+            $fdState = "would download $($fd.Found.Count)"
+        } else {
+            if ($fdBad.Count -gt 0) {
+                Status $G.Warn 'force download' "$($fdBad.Count) of $($fd.Found.Count) failed: $($fdBad -join ', ')" $Clr.Orange
+                $script:Ledger.Warnings.Add("DOWNLOAD FAILED AFTER THE RESET: $($fdBad -join ', ') — look up the code before resetting again")
+                $fdStuck = $true
+            }
+            if ($fdOk.Count -gt 0) {
+                Status $G.Ok 'force download' "$($fdOk.Count) downloaded and staged — run Panacea to install" $Clr.Green
+            }
+            $fdState = "$($fdOk.Count) of $($fd.Found.Count) downloaded"
+        }
+    } catch {
+        Status $G.Fail 'force download' "could not start: $($_.Exception.Message.Split("`n")[0])" $Clr.Red
+        $fdState = 'failed'; $fdStuck = $true
+    }
+} else {
+    Status $G.Skip 'force download' 'off in config' $Clr.Grey
+}
+
 # ask for a detection pass. report that it was ASKED FOR, never that the box is
 # current — under SYSTEM the COM search can no-op silently and "current" would lie.
 $scanAsked = $false
@@ -956,7 +1188,7 @@ $rebootNeeded = ($script:Ledger.PendingAfter.Count -gt 0) -or ($script:StuckPkgs
                 ($repairResult -eq 'repaired') -or ($sfcResult -eq 'repaired')
 
 # overall status tag — same three-state language as Panacea's label
-if ($repairResult -eq 'failed' -or $sfcResult -eq 'unfixable' -or ($script:Ledger.Symptoms.Count -gt 0 -and $repairResult -eq 'failed')) {
+if ($repairResult -eq 'failed' -or $sfcResult -eq 'unfixable' -or $fdStuck -or ($script:Ledger.Symptoms.Count -gt 0 -and $repairResult -eq 'failed')) {
     $tag = "$($G.Bell) ATTENTION"; $tagColor = $Clr.Orange
 } elseif ($sdRenamed -or $repairResult -eq 'repaired' -or $sfcResult -eq 'repaired' -or $script:BitsCount -gt 0) {
     $tag = "$($G.Staff) DISSOLVED"; $tagColor = $Clr.Cyan
@@ -995,6 +1227,7 @@ if ($script:BitsCount -gt 0) { Roll 'bits queue' "$($script:BitsCount) jobs clea
 if ($script:MdmPolicy.Count -gt 0) { Roll 'policy' "MDM ring active ($($script:MdmPolicy.Count) settings)" }
 elseif ($script:Policy.Count -gt 0) { Roll 'policy' 'group policy present' }
 else { Roll 'policy' 'none set' }
+Roll 'download' $fdState
 if ($scanAsked) { Roll 'scan' 'requested — NOT verified' } else { Roll 'scan' 'not requested' }
 if ($script:Ledger.UptimeText) { Roll 'uptime' $script:Ledger.UptimeText }
 Roll 'free space' "$($script:Ledger.FreeGB) GB"
@@ -1050,6 +1283,9 @@ $summary = [ordered]@{
     mdm_policy     = @($script:MdmPolicy)
     stuck_packages = $script:StuckPkgs.Count
     wu_errors      = $script:WuErrCount
+    force_download = $fdState
+    downloaded     = @($fdOk)
+    download_failed= @($fdBad)
     scan_requested = [bool]$scanAsked
     pending_before = @($script:Ledger.PendingBefore)
     pending_after  = @($script:Ledger.PendingAfter)
@@ -1067,7 +1303,7 @@ try {
 # exit code contract: 0 clear, 1 reboot-needed, 2 needs-attention
 # stored in $global:AlkahestExit so RMM can read it; NO exit call so backstage stays alive
 try { Stop-Transcript -ErrorAction SilentlyContinue | Out-Null } catch {}
-if ($repairResult -eq 'failed' -or $sfcResult -eq 'unfixable') { $global:AlkahestExit = 2 }
+if ($repairResult -eq 'failed' -or $sfcResult -eq 'unfixable' -or $fdStuck) { $global:AlkahestExit = 2 }
 elseif ($rebootNeeded) { $global:AlkahestExit = 1 }
 else { $global:AlkahestExit = 0 }
 $exitVal = $global:AlkahestExit

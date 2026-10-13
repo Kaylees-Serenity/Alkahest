@@ -3,7 +3,8 @@
 **The universal solvent.** Sibling to [Panacea](../panacea). Panacea is the general tune-up;
 ALKAHEST does one thing: it unsticks a Windows Update stack that will not move.
 
-One file, one paste, no installs, no downloads, no reboots.
+One file, one paste, no installs, no tools fetched, no reboots. The only thing it downloads is
+the Windows Update payloads the box was already stuck on, to prove the reset worked.
 
 ```
 DIAGNOSE  ->  QUENCH  ->  DISSOLVE  ->  RECONSTITUTE  ->  PROGNOSIS
@@ -54,6 +55,28 @@ running, `S` skips it.
 | 4 | Timeouts | ∞ | Cycles ∞ → 30m → 60m. Slow boxes are the normal case |
 | 5 | Clear WU policy | **off** | Backs up then removes GPO-path WSUS keys. Requires typing `CLEAR` |
 | 6 | Queue locked work | off | If a cache is locked, schedule the rename for next boot |
+| 7 | Force download | on | After the reset, downloads pending updates (never installs) and reads back each one |
+
+## Forced download
+
+A scan request only asks Windows to look. On a box that was stuck at "downloading", that
+proves nothing, so PROGNOSIS goes one step further: it searches, downloads every pending
+quality and servicing update (drivers and feature upgrades stay fenced off), and reads the
+verdict for each update on its own instead of trusting the batch result.
+
+- **Downloaded:** the reset worked. The roll-up says how many, and Panacea installs them.
+- **Some failed:** each one is named with its HRESULT on the orange sticker. Look the code up
+  before resetting again; a second reset rarely fixes what the first didn't.
+- **Still stuck after two hours:** the cache was never the cause. The problem is past this
+  endpoint (network path, proxy, WSUS, Delivery Optimization) and the label says so.
+  `WuDownloadTimeoutSec` sets the ceiling, and `S` gives up sooner on an interactive console.
+
+The download runs on a worker thread because WUA's `Download()` call blocks until Windows
+Update gives up, which a wedged stack never does. The async `BeginDownload` would avoid that,
+but it needs a compiled COM callback, which means `Add-Type` and `csc.exe`, the same kind of
+EDR-flagged LOLBin this script avoids everywhere else. If the ceiling hits, the worker is
+abandoned mid-call and never goes on to anything else. Panacea carries the identical
+`Invoke-WuPipeline`, so change both or neither.
 
 ## Panda Adaptive Defense
 
@@ -116,7 +139,8 @@ and a pinned target release version look exactly like a stuck update stack.
   backed up to `.reg` first, and refuses to proceed if the backup fails.
 - **Claim the machine is up to date.** It requests a detection pass and reports that it
   *asked*. Under SYSTEM the COM search can no-op silently, and a "current" verdict from here
-  would be a lie.
+  would be a lie. A forced download that finds nothing reports "nothing offered", not "current".
+- **Install updates.** It downloads them and stops. Installing is Panacea's job.
 
 ## Notes for the next person in this file
 
