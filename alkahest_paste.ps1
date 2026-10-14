@@ -4,10 +4,10 @@
     ℞ ALKAHEST — the universal solvent
     Sibling to Panacea. Dissolves stuck / pending Windows Updates.
     Native-only · fails-closed · single-paste · nothing deleted · never reboots
-    Run from ScreenConnect backstage (SYSTEM) or frontstage admin prompt.
+    Run from a remote-support shell as SYSTEM, or an elevated admin prompt.
 
-    Panda Adaptive Defense note: no regsvr32, no bitsadmin, no wusa, no sc.exe,
-    no -EncodedCommand. Those are the LOLBins Panda blocks. See DISSOLVE.
+    EDR note: no regsvr32, no bitsadmin, no wusa, no sc.exe, no -EncodedCommand.
+    Those are the LOLBins strict endpoint protection blocks. See DISSOLVE.
 #>
 
 # ═══════════════════════════════════════════════════════════════
@@ -84,7 +84,7 @@ $script:Ledger = [ordered]@{
     UptimeDays   = 0
     UptimeText   = ''
     FreeGB       = 0.0
-    PandaPresent = $false
+    EdrPresent   = $false
     PendingBefore = New-Object System.Collections.Generic.List[string]
     PendingAfter  = New-Object System.Collections.Generic.List[string]
     Warnings     = New-Object System.Collections.Generic.List[string]
@@ -143,7 +143,7 @@ function Show-Banner {
 
 # ═══════════════════════════════════════════════════════════════
 #  SETUP  —  interactive configure panel before the solvent runs.
-#             non-interactive contexts (SYSTEM/backstage) skip it.
+#             non-interactive contexts (SYSTEM/remote shell) skip it.
 # ═══════════════════════════════════════════════════════════════
 $script:AlkahestAbort = $false
 function Show-Setup {
@@ -586,7 +586,7 @@ function Stop-UpdateService($Name,$Nice) {
     }
     Status $G.Warn $Nice 'would not stop' $Clr.Orange
     Note @(
-        'three attempts refused. on a Panda box this is usually the endpoint agent',
+        'three attempts refused. under strict EDR this is usually the endpoint agent',
         'holding the service or its files open mid-scan. not fatal — the cache',
         'rename below will report locked and the servicing repair still runs.'
     )
@@ -672,23 +672,28 @@ try {
 } catch { Status $G.Skip 'disk headroom' 'unreadable' $Clr.Grey }
 
 # 4 — endpoint protection. name it, because it changes what will work.
-$pandaHits = @()
-foreach ($sn in @('PandaAetherAgent','PSUAService','NanoServiceMain','PandaSecurityService','PandaAgent')) {
-    try { if (Get-Service -Name $sn -ErrorAction Stop) { $pandaHits += $sn } } catch {}
-}
-if (Test-Path 'HKLM:\SOFTWARE\Panda Security') { $pandaHits += 'registry' }
-if (Test-Path 'HKLM:\SOFTWARE\WOW6432Node\Panda Security') { $pandaHits += 'registry(x86)' }
-if ($pandaHits.Count -gt 0) {
-    $script:Ledger.PandaPresent = $true
-    Status $G.Warn 'endpoint protection' ("Panda present — " + ($pandaHits -join ', ')) $Clr.Orange
+# Security Center lists every registered antivirus product on client Windows.
+# anything other than Defender is third-party EDR, named at runtime, never in code.
+$edrHits = @(); $edrRead = $false
+try {
+    $av = @(Get-CimInstance -Namespace 'root/SecurityCenter2' -ClassName AntiVirusProduct -ErrorAction Stop)
+    $edrHits = @($av | Where-Object { $_.displayName -notmatch 'Defender' } |
+                 ForEach-Object { $_.displayName } | Select-Object -Unique)
+    $edrRead = $true
+} catch {}
+if ($edrHits.Count -gt 0) {
+    $script:Ledger.EdrPresent = $true
+    Status $G.Warn 'endpoint protection' ("third-party EDR — " + ($edrHits -join ', ')) $Clr.Orange
     Note @(
         'the usual "reset windows update" recipe re-registers a dozen DLLs with',
-        'regsvr32 and drives BITS with bitsadmin. Panda blocks or quarantines both,',
+        'regsvr32 and drives BITS with bitsadmin. strict EDR blocks or quarantines both,',
         'so ALKAHEST uses neither. if a hand-run of that recipe is how this box got',
         'here, the aborted half of it is likely part of the blockage.'
     )
+} elseif ($edrRead) {
+    Status $G.Ok 'endpoint protection' 'Defender only, no third-party EDR found' $Clr.Green
 } else {
-    Status $G.Ok 'endpoint protection' 'no Panda signature found' $Clr.Green
+    Status $G.Skip 'endpoint protection' 'unreadable (no Security Center on this SKU)' $Clr.Grey
 }
 
 # 5 — service posture
@@ -965,7 +970,7 @@ if (Get-Command Delete-DeliveryOptimizationCache -ErrorAction SilentlyContinue) 
 } else { Status $G.Skip 'delivery optimization' 'cmdlet not on this build' $Clr.Grey }
 
 # the deliberate omissions, stated out loud rather than silently skipped
-Status $G.Skip 'regsvr32 re-register' 'not attempted by design — Panda blocks it' $Clr.Grey
+Status $G.Skip 'regsvr32 re-register' 'not attempted by design — EDR blocks it' $Clr.Grey
 Status $G.Skip 'bitsadmin/wusa/sc' 'not attempted by design — EDR-flagged LOLBins' $Clr.Grey
 Status $G.Ok  'sacred' 'user files + recycle bin — untouched, always' $Clr.Green
 
@@ -1175,7 +1180,7 @@ if (-not $Alkahest.DryRun) {
         } else { Status $G.Warn 'detection pass' 'no way to request a scan on this build' $Clr.Orange }
     }
     if ($scanAsked) {
-        $script:Ledger.Warnings.Add('SCAN REQUESTED, NOT VERIFIED — watch Settings > Windows Update on the frontstage session before calling this fixed')
+        $script:Ledger.Warnings.Add('SCAN REQUESTED, NOT VERIFIED — watch Settings > Windows Update on the user's desktop before calling this fixed')
     }
 }
 
@@ -1274,7 +1279,7 @@ $summary = [ordered]@{
     dry_run        = [bool]$Alkahest.DryRun
     uptime_days    = $script:Ledger.UptimeDays
     free_gb        = $script:Ledger.FreeGB
-    panda_present  = [bool]$script:Ledger.PandaPresent
+    edr_present    = [bool]$script:Ledger.EdrPresent
     caches_renamed = [bool]$sdRenamed
     bits_cleared   = $script:BitsCount
     store_repair   = $repairResult
@@ -1301,7 +1306,7 @@ try {
 } catch {}
 
 # exit code contract: 0 clear, 1 reboot-needed, 2 needs-attention
-# stored in $global:AlkahestExit so RMM can read it; NO exit call so backstage stays alive
+# stored in $global:AlkahestExit so RMM can read it; NO exit call so the remote shell stays alive
 try { Stop-Transcript -ErrorAction SilentlyContinue | Out-Null } catch {}
 if ($repairResult -eq 'failed' -or $sfcResult -eq 'unfixable' -or $fdStuck) { $global:AlkahestExit = 2 }
 elseif ($rebootNeeded) { $global:AlkahestExit = 1 }
