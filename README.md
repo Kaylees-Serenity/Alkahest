@@ -40,7 +40,7 @@ It downloads and stops. Installing is Panacea's job.
 
 ## Built for EDR
 
-ALKAHEST was written for machines running Panda Adaptive Defense, which is why it doesn't look like the "reset Windows Update" recipe pasted around forums. The steps EDR blocks are skipped on purpose, and the output says so instead of failing quietly.
+ALKAHEST was written for machines running strict endpoint protection, which is why it doesn't look like the "reset Windows Update" recipe pasted around forums. The steps EDR blocks are skipped on purpose, and the output says so instead of failing quietly.
 
 | Never used | Used instead |
 |---|---|
@@ -55,7 +55,7 @@ EDR often holds file handles inside `SoftwareDistribution` while it scans downlo
 
 ## Usage
 
-1. Open PowerShell as Administrator, or a ScreenConnect backstage session (runs as SYSTEM).
+1. Open PowerShell as Administrator, or a remote-support shell running as SYSTEM.
 2. Paste the entire contents of `alkahest_paste.ps1` and press Enter.
 
 In an interactive session, a setup panel appears first:
@@ -113,7 +113,7 @@ Each run writes two files to `%ProgramData%\Alkahest\Updates\`:
 
 Policy backups, when made, land in the same folder as `wu_policy_<HOST>_<timestamp>.reg`.
 
-The result is also left in `$AlkahestExit` instead of being passed to `exit`, so a backstage session stays open afterwards:
+The result is also left in `$AlkahestExit` instead of being passed to `exit`, so a remote shell stays open afterwards:
 
 | `$AlkahestExit` | Meaning |
 |---|---|
