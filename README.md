@@ -1,6 +1,6 @@
 # ℞ ALKAHEST
 
-**A single-paste fix for a stuck Windows Update.** When Settings has said "downloading" for three days, paste this into an elevated PowerShell prompt or a ScreenConnect backstage session. It finds out why, resets the update stack, and proves the reset worked by actually pulling the stuck updates down.
+**A single-paste fix for a stuck Windows Update.** When Settings has said "downloading" for three days, paste this into an elevated PowerShell prompt. It finds out why, resets the update stack, and proves the reset worked by actually pulling the stuck updates down.
 
 The sibling to [Panacea](https://github.com/Kaylees-Serenity/panacea). Panacea is the general tune-up; ALKAHEST does one job. Native Windows tools only, nothing deleted, never reboots, and built to run under EDR without tripping it.
 
