@@ -1,155 +1,148 @@
-# ALKAHEST
+# ℞ ALKAHEST
 
-**The universal solvent.** Sibling to [Panacea](../panacea). Panacea is the general tune-up;
-ALKAHEST does one thing: it unsticks a Windows Update stack that will not move.
+**A single-paste fix for a stuck Windows Update.** When Settings has said "downloading" for three days, paste this into an elevated PowerShell prompt or a ScreenConnect backstage session. It finds out why, resets the update stack, and proves the reset worked by actually pulling the stuck updates down.
 
-One file, one paste, no installs, no tools fetched, no reboots. The only thing it downloads is
-the Windows Update payloads the box was already stuck on, to prove the reset worked.
+The sibling to [Panacea](https://github.com/Kaylees-Serenity/panacea). Panacea is the general tune-up; ALKAHEST does one job. Native Windows tools only, nothing deleted, never reboots, and built to run under EDR without tripping it.
 
 ```
-DIAGNOSE  ->  QUENCH  ->  DISSOLVE  ->  RECONSTITUTE  ->  PROGNOSIS
- read it     stop it     rename it     put it back      tell the truth
+ █████╗ ██╗    ██╗  ██╗ █████╗ ██╗  ██╗███████╗███████╗████████╗
+██╔══██╗██║    ██║ ██╔╝██╔══██╗██║  ██║██╔════╝██╔════╝╚══██╔══╝
+███████║██║    █████╔╝ ███████║███████║█████╗  ███████╗   ██║
+██╔══██║██║    ██╔═██╗ ██╔══██║██╔══██║██╔══╝  ╚════██║   ██║
+██║  ██║██████╗██║  ██╗██║  ██║██║  ██║███████╗███████║   ██║
+╚═╝  ╚═╝╚═════╝╚═╝  ╚═╝╚═╝  ╚═╝╚═╝  ╚═╝╚══════╝╚══════╝   ╚═╝
+   ℞  THE UNIVERSAL SOLVENT  ·  apothecary systems
 ```
 
-## Same chrome as Panacea
+## What it does
 
-They are meant to look and behave like the same instrument. Shared, byte-for-byte where it
-matters:
+ALKAHEST runs in five stages, named in the same apothecary style as Panacea.
 
-- **Palette** — the same `$Clr` table (orange `255,140,0`, green `80,200,120`,
-  cyan `90,190,220`, grey `120,120,120`, red `220,50,50`).
-- **VT sniff and ASCII skin** — `$Host.UI.SupportsVirtualTerminal`, with the same `$G` glyph
-  map degrading `[✓] ℞ ⚕ ⚠` to `[OK] Rx + !!` when the console can't do truecolor.
-- **`Rule` / `Status` / `Roll`** — identical signatures, identical dot-leader widths, the same
-  `[DRY RUN]` suffix on every tier header.
-- **`Invoke-Guarded`** — Panacea's, adopted whole: `Register-ObjectEvent` with a `try/finally`
-  unregister so no subscription outlives the scriptblock, braille spinner, `-ShowNative` for
-  DISM/SFC's own progress bar, S-key skip, `0` meaning infinite.
-- **Rx label** — same 62-wide box, same `RX # / DATE / REFILLS ∞ / PATIENT / PRESCRIBER / DX`
-  header, same conditional orange **AUXILIARY WARNINGS** sticker, same
-  `keep out of reach of end users` footer.
-- **Exit contract** — `$global:AlkahestExit` (0 clear, 1 reboot-needed, 2 attention), no `exit`
-  call, same `dispensary closed · ... · log:` epitaph, JSON summary written beside the
-  transcript for RMM ingest.
-- **SFC verdict** — read from the CBS.log delta, not stdout, because `-ShowNative` doesn't
-  redirect stdout. Same technique as Panacea's MEND tier, same English-string caveat.
+| Stage | What happens |
+|---|---|
+| **DIAGNOSE** | Reads everything that can wedge Windows Update: elevation, uptime, disk space, update service state, the BITS queue, the SoftwareDistribution cache, the component store, staged servicing operations, stuck packages, recent update errors, disabled orchestrator tasks, Update Medic, GPO and Intune update policy, the WSUS endpoint, and which endpoint protection is running. Stops here if it isn't running as admin or SYSTEM. |
+| **QUENCH** | Stops the update stack (Update Orchestrator, Delivery Optimization, Windows Update, BITS, Cryptographic Services, Windows Installer) before touching anything. |
+| **DISSOLVE** | Cancels BITS jobs, renames `SoftwareDistribution` and `catroot2` out of the way, and purges the Delivery Optimization cache. Renamed, never deleted, so every step can be undone. |
+| **RECONSTITUTE** | Puts service startup types back where Windows expects them, re-enables disabled update tasks, and, only if you asked, repairs the component store with DISM and SFC or clears the update policy. |
+| **PROGNOSIS** | Restarts the stack, then forces a download of every pending update and checks each one. Reports **CLEAR**, **DISSOLVED** or **ATTENTION**, with anything you need to act on. |
 
-Tier verbs differ on purpose: Panacea mends and doses, ALKAHEST quenches and dissolves.
+## Proves the fix instead of hoping
 
-## Running it
+Asking Windows to "check for updates" proves nothing on a box that was stuck at downloading. So after the reset, ALKAHEST downloads every pending quality and servicing update (never drivers or feature upgrades) and reads back the result for each one.
 
-Copy the **entire** contents of `alkahest_paste.ps1` — from `$alkahest = @'` through the
-final `[ScriptBlock]::Create($alkahest).Invoke()` — and paste it into an elevated
-ScreenConnect backstage or frontstage PowerShell prompt. It arrives as one indivisible
-object, so the console cannot nibble it line by line and detonate a fragment early.
+- **Downloaded:** the reset worked. Run Panacea to install them.
 
-The DISPENSARY SETUP panel opens first on an interactive console and is skipped under
-SYSTEM. `Enter` proceeds, `Q` quits touching nothing, number keys toggle. Once a long step is
-running, `S` skips it.
+- **Some failed:** each one is listed with its error code. Look the code up before resetting again; a second reset rarely fixes what the first didn't.
 
-| # | Option | Default | What it does |
-|---|---|---|---|
-| 1 | DryRun | off | Narrates every action, changes nothing |
-| 2 | Servicing repair | on | DISM RestoreHealth + SFC, only if the store looks sick |
-| 3 | WinSxS cleanup | off | `StartComponentCleanup`, never `/ResetBase` |
-| 4 | Timeouts | ∞ | Cycles ∞ → 30m → 60m. Slow boxes are the normal case |
-| 5 | Clear WU policy | **off** | Backs up then removes GPO-path WSUS keys. Requires typing `CLEAR` |
-| 6 | Queue locked work | off | If a cache is locked, schedule the rename for next boot |
-| 7 | Force download | on | After the reset, downloads pending updates (never installs) and reads back each one |
+- **Still stuck after two hours:** the cache was never the problem. It's somewhere past this machine (network path, proxy, WSUS, Delivery Optimization), and the report says so.
 
-## Forced download
+It downloads and stops. Installing is Panacea's job.
 
-A scan request only asks Windows to look. On a box that was stuck at "downloading", that
-proves nothing, so PROGNOSIS goes one step further: it searches, downloads every pending
-quality and servicing update (drivers and feature upgrades stay fenced off), and reads the
-verdict for each update on its own instead of trusting the batch result.
+## Built for EDR
 
-- **Downloaded:** the reset worked. The roll-up says how many, and Panacea installs them.
-- **Some failed:** each one is named with its HRESULT on the orange sticker. Look the code up
-  before resetting again; a second reset rarely fixes what the first didn't.
-- **Still stuck after two hours:** the cache was never the cause. The problem is past this
-  endpoint (network path, proxy, WSUS, Delivery Optimization) and the label says so.
-  `WuDownloadTimeoutSec` sets the ceiling, and `S` gives up sooner on an interactive console.
+ALKAHEST was written for machines running Panda Adaptive Defense, which is why it doesn't look like the "reset Windows Update" recipe pasted around forums. The steps EDR blocks are skipped on purpose, and the output says so instead of failing quietly.
 
-The download runs on a worker thread because WUA's `Download()` call blocks until Windows
-Update gives up, which a wedged stack never does. The async `BeginDownload` would avoid that,
-but it needs a compiled COM callback, which means `Add-Type` and `csc.exe`, the same kind of
-EDR-flagged LOLBin this script avoids everywhere else. If the ceiling hits, the worker is
-abandoned mid-call and never goes on to anything else. Panacea carries the identical
-`Invoke-WuPipeline`, so change both or neither.
+| Never used | Used instead |
+|---|---|
+| `regsvr32` re-registering update DLLs | Not needed; caches are rebuilt by Windows |
+| `bitsadmin.exe` | `Get-BitsTransfer` / `Remove-BitsTransfer` |
+| `net stop`, `sc.exe config` | `Stop-Service` / `Set-Service` |
+| `wusa.exe` | The native Windows Update API |
+| `-EncodedCommand`, base64, download cradles | Nothing. Never. |
+| Deleting anything | `Rename-Item` |
 
-## Panda Adaptive Defense
+EDR often holds file handles inside `SoftwareDistribution` while it scans downloaded updates. Renames retry with backoff, then fall back to renaming `Download` and `DataStore` individually, then report the folder as locked instead of forcing it. A blocked step never kills the run.
 
-This was written for an estate that runs Panda, which is why it does not look like the
-"reset Windows Update" recipe everyone pastes off a forum.
+## Usage
 
-**Not used, on purpose, and reported as such in the output:**
+1. Open PowerShell as Administrator, or a ScreenConnect backstage session (runs as SYSTEM).
+2. Paste the entire contents of `alkahest_paste.ps1` and press Enter.
 
-- `regsvr32` re-registration of the WU DLLs — the single most-blocked step in the old recipe
-- `bitsadmin.exe`, `wusa.exe`, `sc.exe config`, `net stop` — LOLBins that light up EDR
-- `-EncodedCommand`, download cradles, base64 — never
-- deleting anything at all
+In an interactive session, a setup panel appears first:
 
-**Used instead:** `Stop-Service` / `Set-Service`, `Get-BitsTransfer` / `Remove-BitsTransfer`,
-`Delete-DeliveryOptimizationCache`, `Enable-ScheduledTask`, `Rename-Item`, and the two
-Microsoft-signed binaries nobody argues with, `DISM.exe` and `sfc.exe`.
+```
+── DISPENSARY SETUP
+   [1] DryRun ............ OFF
+   [2] Servicing repair .. ON
+   [3] WinSxS cleanup .... OFF
+   [4] Timeouts .......... ∞
+   [5] Clear WU policy ... OFF
+   [6] Queue locked work . OFF
+   [7] Force download .... ON
 
-Panda also holds file handles inside `SoftwareDistribution` while it scans staged payloads,
-so renames retry four times with backoff, fall back to renaming `Download` and `DataStore`
-individually, and then report locked rather than forcing anything. A blocked step never kills
-the run.
+   [Enter] proceed  ·  [Q] quit
+```
+
+Type a number to toggle that option, press Enter to run, or Q to quit without changing anything. Once a long step is running, **S** skips it. In non-interactive contexts (SYSTEM, RMM) the panel is skipped and the defaults from the config block are used.
+
+## Configuration
+
+All settings live in the `CONFIG BLOCK` at the top of the script.
+
+| Setting | Default | Meaning |
+|---|---|---|
+| `DryRun` | `$false` | Report only, change nothing |
+| `ServicingRepair` | `$true` | DISM RestoreHealth and SFC, only if the component store looks sick |
+| `RunWinSxS` | `$false` | DISM component cleanup (never `/ResetBase`) |
+| `ClearPolicy` | `$false` | Back up, then remove GPO Windows Update policy. Requires typing `CLEAR` |
+| `ScheduleLocked` | `$false` | If a cache is locked, queue the rename for the next boot |
+| `ForceDownload` | `$true` | After the reset, download pending updates and check each one |
+| `MinFreeGB` | `10` | Free space below this is flagged; updates stall without room |
+| `WuDownloadTimeoutSec` | `7200` | When a download counts as stuck |
+| `*TimeoutSec` (DISM, SFC, package scan) | `0` | `0` means no limit; slow machines are normal |
+| `NoColor` | `$false` | Force the plain ASCII display |
 
 ## Update policy: GPO vs Intune
 
-The "Clear WU policy" option touches exactly one key,
-`HKLM\SOFTWARE\Policies\Microsoft\Windows\WindowsUpdate`. It is worth knowing what that
-does and does not reach before arming it.
+Deferrals, pauses and a pinned target version look exactly like a stuck update stack, so DIAGNOSE reports both policy sources.
 
-| Source | Writes where | Comes back on its own? |
+| Source | Registry location | Comes back after clearing? |
 |---|---|---|
-| Active Directory GPO | `SOFTWARE\Policies\...\WindowsUpdate` | **Yes.** Own cycle, 90 min by default, or `gpupdate /force` |
-| Intune Update rings | `SOFTWARE\Microsoft\PolicyManager\...\Update` | Not applicable — this option never touches that key |
-| Intune ADMX / Administrative Templates | `SOFTWARE\Policies\...\WindowsUpdate` | **Do not assume it.** See below |
+| Active Directory GPO | `SOFTWARE\Policies\Microsoft\Windows\WindowsUpdate` | **Yes**, on the next policy refresh (90 min default, or `gpupdate /force`) |
+| Intune Update rings | `SOFTWARE\Microsoft\PolicyManager\...\Update` | Never touched by ALKAHEST |
+| Intune Administrative Templates | `SOFTWARE\Policies\Microsoft\Windows\WindowsUpdate` | **Don't assume so.** A routine sync may treat the policy as already applied |
 
-Microsoft documents the two registry paths as separate
-([Configure Windows Update client policies](https://learn.microsoft.com/windows/deployment/update/waas-configure-wufb#summary-mdm-and-group-policy-settings-for-windows-10,-version-1703-and-later)),
-and nothing in the docs promises that MDM re-pushes a value that was deleted locally while the
-policy itself is unchanged. A routine device sync may simply see the policy as already applied.
-The reliable restore is the `.reg` backup, or editing and re-saving the profile in Intune to
-force a change-based push.
+"Clear WU policy" touches only the GPO path and writes a `.reg` backup first. If the backup fails, it refuses to continue. To restore an Intune-delivered value, import the backup or re-save the profile in Intune to force a fresh push. See Microsoft's notes on [Windows Update client policies](https://learn.microsoft.com/windows/deployment/update/waas-configure-wufb) and [Intune policy refresh intervals](https://learn.microsoft.com/intune/device-configuration/troubleshoot-device-profiles#policy-refresh-intervals).
 
-Check-in cadence, for setting expectations on a call: maintenance sync roughly every 8 hours,
-and no more than one every 6.5 hours
-([policy refresh intervals](https://learn.microsoft.com/intune/device-configuration/troubleshoot-device-profiles#policy-refresh-intervals)).
-Faster: **Settings > Accounts > Access work or school > Info > Sync**, or the Sync action in
-the Intune admin center.
+## Output for RMM
 
-DIAGNOSE reads the PolicyManager path too and reports it, because a ring-managed box with an
-empty GPO key would otherwise be reported as having no update policy at all. Deferrals, pauses
-and a pinned target release version look exactly like a stuck update stack.
+Each run writes two files to `%ProgramData%\Alkahest\Updates\`:
 
-## What it will not do
+- `alkahest_<HOST>_<timestamp>.log`, the full transcript
+- `alkahest_<HOST>_<timestamp>.json`, a machine-readable summary (EDR detected, caches renamed, BITS jobs cleared, repair results, GPO and MDM policy found, stuck packages, updates downloaded or failed, pending before and after, reboot needed, overall status)
 
-- **Delete.** Caches are renamed to `.old.<timestamp>`, so every step is reversible.
-- **Reboot.** It says so on the orange sticker when a restart is the actual fix, and stops there.
-- **Touch a staged CBS transaction.** `pending.xml`, `SessionsPending.xml` and the
-  PackagesPending key are reported, never cleared. Clearing those by hand is how a machine
-  gets a half-installed component store.
-- **Clear WSUS/Intune policy silently.** Policy is reported by default; removal is opt-in,
-  backed up to `.reg` first, and refuses to proceed if the backup fails.
-- **Claim the machine is up to date.** It requests a detection pass and reports that it
-  *asked*. Under SYSTEM the COM search can no-op silently, and a "current" verdict from here
-  would be a lie. A forced download that finds nothing reports "nothing offered", not "current".
-- **Install updates.** It downloads them and stops. Installing is Panacea's job.
+Policy backups, when made, land in the same folder as `wu_policy_<HOST>_<timestamp>.reg`.
 
-## Notes for the next person in this file
+The result is also left in `$AlkahestExit` instead of being passed to `exit`, so a backstage session stays open afterwards:
 
-- Presentation is deliberately a copy of Panacea's. If you change the palette, the glyph map,
-  `Rule`/`Status`/`Roll`, or the label frame here, change it there too or the pair stops
-  reading as one instrument.
-- DISM and SFC verdict parsing matches English strings. On a localized install those differ;
-  parse `Image Health State:` out of `%WINDIR%\Logs\DISM\dism.log` instead, which stays
-  English. Same caveat Panacea carries.
-- Adding features here is how this turns into the Swiss army knife it is not supposed to be.
-  Disk cleanup, startup analysis, driver work and SMART all live elsewhere — Panacea and Augur
-  already own them.
+| `$AlkahestExit` | Meaning |
+|---|---|
+| `0` | Clear |
+| `1` | Reboot needed |
+| `2` | Needs attention (repair failed, unfixable SFC damage, downloads still stuck, or not elevated) |
+
+## Requirements
+
+- Windows 10 or 11
+- PowerShell 5.1 or later
+- Administrator or SYSTEM
+- **English (en-US) Windows.** DISM and SFC results are read from their English output. Other languages will run, but repair verdicts may come back as inconclusive.
+
+## Safety
+
+- Never deletes. Caches are renamed to `.old.<timestamp>`.
+- Never reboots. The report says when a restart is the actual fix.
+- Never touches a staged servicing transaction (`pending.xml`, `SessionsPending.xml`, PackagesPending). They're reported, not cleared; clearing them by hand is how a machine ends up with a half-installed component store.
+- Never clears update policy unless you turn it on, type `CLEAR`, and the backup succeeds.
+- Never claims a machine is up to date. A forced download that finds nothing reports "nothing offered", not "current".
+- Never touches user files or the Recycle Bin.
+
+## Credits
+
+Designed, directed and field-tested by Kaylee. Code written with AI assistance.
+
+## License
+
+[MIT](LICENSE)
+
+*Dispensed by ALKAHEST · keep out of reach of end users.*
